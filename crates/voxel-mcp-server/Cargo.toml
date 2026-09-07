@@ -1,0 +1,19 @@
+[package]
+name = "voxel_mcp_server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "stdio MCP server binary for the voxel editor"
+
+[[bin]]
+name = "voxel-mcp-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
+rmcp.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+voxel_mcp.workspace = true

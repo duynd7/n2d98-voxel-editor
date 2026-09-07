@@ -1,0 +1,13 @@
+[package]
+name = "voxel_vox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MagicaVoxel .vox read/write (SIZE/XYZI/RGBA + extensions skipped safely)"
+
+[dependencies]
+thiserror.workspace = true
+voxel_core.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

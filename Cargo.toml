@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/voxel-core",
+    "crates/voxel-vox",
+    "crates/voxel-mcp",
+    "crates/voxel-mcp-server",
+    "crates/voxel-editor",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["n2d98"]
+repository = "https://github.com/n2d98/voxel-editor"
+
+[workspace.dependencies]
+anyhow = "1"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["full"] }
+schemars = "1"
+rmcp = { version = "0.12", features = ["server", "transport-io"] }
+eframe = { version = "0.32", default-features = true, features = ["default_fonts", "glow"] }
+egui = "0.32"
+
+voxel_core = { path = "crates/voxel-core" }
+voxel_vox = { path = "crates/voxel-vox" }
+voxel_mcp = { path = "crates/voxel-mcp" }

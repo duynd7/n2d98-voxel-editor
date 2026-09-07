@@ -1,0 +1,10 @@
+/target/
+**/*.rs.bk
+.DS_Store
+._*
+**/._*
+project.vox
+*.vox
+!examples/**/*.vox
+.idea/
+.vscode/

@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "voxel-editor": {
+      "command": "/Volumes/Duy SSD/submarine/n2d98_voxel/Untitled/target/release/voxel-mcp-server",
+      "args": [
+        "--project",
+        "/Volumes/Duy SSD/submarine/n2d98_voxel/Untitled/project.vox",
+        "--size",
+        "32"
+      ],
+      "env": {
+        "RUST_LOG": "info"
+      }
+    }
+  }
+}

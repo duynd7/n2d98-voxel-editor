@@ -1,0 +1,22 @@
+[package]
+name = "voxel_editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cross-platform voxel editor GUI (egui)"
+
+[[bin]]
+name = "voxel-editor"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+eframe = { workspace = true, features = ["glow"] }
+egui.workspace = true
+egui_glow = "0.32"
+glam = "0.30"
+glow = "0.16"
+parking_lot.workspace = true
+rfd = "0.15"
+voxel_core.workspace = true
+voxel_vox.workspace = true
