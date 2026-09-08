@@ -1,8 +1,8 @@
 //! MagicaVoxel `.vox` reader/writer with scene graph (nTRN/nGRP/nSHP).
 
 use std::fs::File;
-use std::io::{Read, Write};
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use voxel_core::{ColorRgba, Palette, Project, Scene, VoxelModel};
 
 mod dict;
@@ -39,11 +39,29 @@ pub fn load_path(path: impl AsRef<Path>) -> Result<Project> {
 }
 
 pub fn save_path(project: &Project, path: impl AsRef<Path>) -> Result<()> {
+    let path = path.as_ref();
     let snap = project.snapshot();
     let bytes = write_vox_scene(&snap.scene, &snap.palette)?;
-    let mut file = File::create(path)?;
-    file.write_all(&bytes)?;
+    let tmp = sibling_temp(path);
+    std::fs::write(&tmp, &bytes)?;
+    #[cfg(windows)]
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+fn sibling_temp(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| "project.vox".into());
+    name.push(".tmp");
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
 }
 
 /// Legacy single-model API.

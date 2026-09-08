@@ -20,3 +20,4 @@ parking_lot.workspace = true
 rfd = "0.15"
 voxel_core.workspace = true
 voxel_vox.workspace = true
+voxel_export.workspace = true

@@ -139,6 +139,15 @@ pub struct AddObjectParams {
     pub size: u32,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExportGodotParams {
+    /// Output .glb path, or a directory (writes voxel_model.glb + .tscn).
+    pub path: String,
+    /// world (all objects, default) | model (active model only)
+    #[serde(default)]
+    pub scope: String,
+}
+
 impl BrushParams {
     pub fn mirror(&self) -> MirrorAxes {
         MirrorAxes {

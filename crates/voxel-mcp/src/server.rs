@@ -275,7 +275,9 @@ impl VoxelMcpServer {
         Ok(text(format!("loaded {}", path.display())))
     }
 
-    #[tool(description = "Reload the currently bound project file from disk")]
+    #[tool(
+        description = "Reload the bound .vox from disk into this MCP session. The GUI watches the same file and auto-reloads after generate/save — the user does not need to click Reload."
+    )]
     fn reload(&self) -> Result<CallToolResult, McpError> {
         let path = self.state.path.lock().clone();
         let loaded = load_path(&path).map_err(internal)?;
@@ -377,6 +379,35 @@ impl VoxelMcpServer {
         self.state.persist()?;
         Ok(text(format!("duplicated → node_id={id}")))
     }
+
+    #[tool(
+        description = "Export for Godot 4: writes a .glb (glTF 2.0, Y-up, vertex colors, unlit) plus a .tscn wrapper. 1 voxel = 1 Godot unit. MagicaVoxel Z-up is converted to Godot Y-up. scope: world (all objects, default) or model (active model only). Drop the .glb into a Godot project; if the .tscn is in a subfolder, fix its res:// path or instance the .glb directly."
+    )]
+    fn export_godot(
+        &self,
+        Parameters(p): Parameters<ExportGodotParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let scope = voxel_export::ExportScope::parse(&p.scope).map_err(|e| {
+            McpError::invalid_params(e.to_string(), None)
+        })?;
+        let out = voxel_export::export_godot(&self.state.project, &p.path, scope)
+            .map_err(internal)?;
+        Ok(text(
+            serde_json::json!({
+                "glb": out.glb_path.display().to_string(),
+                "tscn": out.tscn_path.display().to_string(),
+                "scope": match scope {
+                    voxel_export::ExportScope::World => "world",
+                    voxel_export::ExportScope::ActiveModel => "model",
+                },
+                "meshes": out.meshes,
+                "vertices": out.vertices,
+                "triangles": out.triangles,
+                "note": "Godot 4: instance the .glb (vertex colors). 1 voxel = 1 unit. Z-up → Y-up."
+            })
+            .to_string(),
+        ))
+    }
 }
 
 #[tool_handler]
@@ -396,7 +427,8 @@ impl ServerHandler for VoxelMcpServer {
                 "Voxel editor MCP (MagicaVoxel-compatible .vox) with Model + World modes. \
                  Coordinates: X right, Y depth, Z up. Colors are palette indices 1..=255. \
                  Use set_edit_mode/list_objects/add_object/set_object_translation for the world editor. \
-                 Voxel paint tools (set_voxel, fill_*) operate on the active model."
+                 Voxel paint tools (set_voxel, fill_*) operate on the active model and persist the .vox; \
+                 the GUI auto-reloads that file. After generating, call export_godot to write a Godot 4 .glb."
                     .into(),
             ),
         }

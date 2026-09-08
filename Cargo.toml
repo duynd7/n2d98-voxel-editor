@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/voxel-core",
     "crates/voxel-vox",
+    "crates/voxel-export",
     "crates/voxel-mcp",
     "crates/voxel-mcp-server",
     "crates/voxel-editor",
@@ -31,4 +32,5 @@ egui = "0.32"
 
 voxel_core = { path = "crates/voxel-core" }
 voxel_vox = { path = "crates/voxel-vox" }
+voxel_export = { path = "crates/voxel-export" }
 voxel_mcp = { path = "crates/voxel-mcp" }

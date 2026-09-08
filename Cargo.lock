@@ -3682,7 +3682,18 @@ dependencies = [
  "parking_lot",
  "rfd",
  "voxel_core",
+ "voxel_export",
  "voxel_vox",
+]
+
+[[package]]
+name = "voxel_export"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "voxel_core",
 ]
 
 [[package]]
@@ -3699,6 +3710,7 @@ dependencies = [
  "tokio",
  "tracing",
  "voxel_core",
+ "voxel_export",
  "voxel_vox",
 ]
 
