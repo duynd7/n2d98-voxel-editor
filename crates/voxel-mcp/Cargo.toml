@@ -17,3 +17,4 @@ tokio.workspace = true
 tracing.workspace = true
 voxel_core.workspace = true
 voxel_vox.workspace = true
+voxel_export.workspace = true

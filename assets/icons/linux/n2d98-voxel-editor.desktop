@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Voxel Editor
+Comment=n2d98 MagicaVoxel-compatible voxel editor
+Exec=voxel-editor %f
+Icon=n2d98-voxel-editor
+Terminal=false
+Categories=Graphics;3DGraphics;Editor;
+MimeType=application/octet-stream;
+StartupNotify=true

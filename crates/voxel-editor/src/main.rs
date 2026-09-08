@@ -9,16 +9,68 @@ mod viewport;
 use camera::OrbitCamera;
 use eframe::egui;
 use glam::Vec2;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 use viewport::{LineLayer, OverlayFrame, Viewport3D};
 use voxel_core::{local_to_world, ColorIndex, EditMode, IVec3, Project};
+use voxel_export::ExportScope;
 use voxel_vox::{load_path, save_path};
+
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn load_app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+        .expect("app icon png")
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Shared with Cursor MCP (`--project`). Always absolute so a Finder-launched
+/// `.app` (cwd `/`) never tries to open `/project.vox`.
+fn default_project_path() -> PathBuf {
+    let dir = home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Documents")
+        .join("n2d98 Voxel Editor");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("project.vox")
+}
+
+fn absolutize(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
+fn resolve_project_path() -> PathBuf {
+    let path = if let Ok(p) = std::env::var("VOXEL_PROJECT") {
+        if !p.is_empty() {
+            PathBuf::from(p)
+        } else {
+            default_project_path()
+        }
+    } else if let Some(arg) = std::env::args().nth(1).filter(|a| !a.starts_with('-')) {
+        PathBuf::from(arg)
+    } else {
+        default_project_path()
+    };
+    absolutize(path)
+}
 
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
-            .with_title("Voxel Editor"),
+            .with_title("Voxel Editor")
+            .with_icon(load_app_icon()),
         depth_buffer: 24,
         ..Default::default()
     };
@@ -59,13 +111,16 @@ struct EditorApp {
     last_paint_cell: Option<IVec3>,
     theme_ready: bool,
     prev_show_grid: bool,
+    auto_reload: bool,
+    file_mtime: Option<SystemTime>,
+    disk_mtime: Option<SystemTime>,
+    disk_stable_since: Option<Instant>,
+    disk_conflict: bool,
 }
 
 impl EditorApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let path = PathBuf::from(
-            std::env::var("VOXEL_PROJECT").unwrap_or_else(|_| "project.vox".into()),
-        );
+        let path = resolve_project_path();
         let (project, status) = if path.exists() {
             match load_path(&path) {
                 Ok(p) => (p, format!("Loaded {}", path.display())),
@@ -97,6 +152,7 @@ impl EditorApp {
                 })
                 .unwrap_or((0, 0, 0))
         });
+        let file_mtime = file_mtime(&path);
 
         Self {
             project,
@@ -117,6 +173,11 @@ impl EditorApp {
             last_paint_cell: None,
             theme_ready: false,
             prev_show_grid: true,
+            auto_reload: true,
+            file_mtime,
+            disk_mtime: None,
+            disk_stable_since: None,
+            disk_conflict: false,
         }
     }
 
@@ -124,6 +185,10 @@ impl EditorApp {
         match save_path(&self.project, &self.path) {
             Ok(()) => {
                 self.dirty = false;
+                self.file_mtime = file_mtime(&self.path);
+                self.disk_mtime = self.file_mtime;
+                self.disk_stable_since = None;
+                self.disk_conflict = false;
                 self.status = format!("Saved {}", self.path.display());
             }
             Err(e) => self.status = format!("Save failed: {e}"),
@@ -144,6 +209,10 @@ impl EditorApp {
                     self.viewport3d.mark_dirty();
                     self.dirty = false;
                     self.hover = None;
+                    self.file_mtime = file_mtime(&self.path);
+                    self.disk_mtime = self.file_mtime;
+                    self.disk_stable_since = None;
+                    self.disk_conflict = false;
                     self.status = format!("Opened {}", self.path.display());
                 }
                 Err(e) => self.status = format!("Open failed: {e}"),
@@ -152,17 +221,97 @@ impl EditorApp {
     }
 
     fn reload(&mut self) {
+        self.reload_from_disk(true);
+    }
+
+    fn reload_from_disk(&mut self, frame_camera: bool) {
         match load_path(&self.path) {
             Ok(p) => {
                 self.project = p;
-                self.frame_camera();
+                if frame_camera {
+                    self.frame_camera();
+                }
                 self.sync_translation_fields();
                 self.viewport3d.mark_dirty();
                 self.dirty = false;
                 self.hover = None;
-                self.status = format!("Reloaded {}", self.path.display());
+                self.file_mtime = file_mtime(&self.path);
+                self.disk_mtime = self.file_mtime;
+                self.disk_stable_since = None;
+                self.disk_conflict = false;
+                self.status = if frame_camera {
+                    format!("Reloaded {}", self.path.display())
+                } else {
+                    format!("Auto-reloaded {}", self.path.display())
+                };
             }
-            Err(e) => self.status = format!("Reload failed: {e}"),
+            Err(e) => {
+                if frame_camera {
+                    self.status = format!("Reload failed: {e}");
+                }
+            }
+        }
+    }
+
+    fn poll_external_reload(&mut self, ctx: &egui::Context) {
+        if !self.auto_reload {
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_millis(250));
+        let Some(mtime) = file_mtime(&self.path) else {
+            return;
+        };
+        let newer = self.file_mtime.map(|t| mtime > t).unwrap_or(true);
+        if !newer {
+            self.disk_stable_since = None;
+            self.disk_mtime = Some(mtime);
+            return;
+        }
+        if self.dirty {
+            if !self.disk_conflict {
+                self.disk_conflict = true;
+                self.status =
+                    "File changed on disk (unsaved edits — Reload to discard, or Save to keep yours)"
+                        .into();
+            }
+            return;
+        }
+        if self.disk_mtime != Some(mtime) {
+            self.disk_mtime = Some(mtime);
+            self.disk_stable_since = Some(Instant::now());
+            return;
+        }
+        if self
+            .disk_stable_since
+            .map(|t| t.elapsed() >= Duration::from_millis(400))
+            .unwrap_or(false)
+        {
+            self.reload_from_disk(false);
+        }
+    }
+
+    fn export_godot_dialog(&mut self) {
+        let stem = self
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("voxel_model");
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Godot / glTF Binary", &["glb"])
+            .set_file_name(format!("{stem}.glb"))
+            .save_file()
+        {
+            match voxel_export::export_godot(&self.project, &path, ExportScope::World) {
+                Ok(out) => {
+                    self.status = format!(
+                        "Exported Godot {} ({} meshes, {} tris)",
+                        out.glb_path.display(),
+                        out.meshes,
+                        out.triangles
+                    );
+                }
+                Err(e) => self.status = format!("Godot export failed: {e}"),
+            }
         }
     }
 
@@ -442,6 +591,7 @@ impl eframe::App for EditorApp {
             theme::apply(ctx);
             self.theme_ready = true;
         }
+        self.poll_external_reload(ctx);
 
         // ── Top bar ──────────────────────────────────────────────
         egui::TopBottomPanel::top("top")
@@ -473,6 +623,11 @@ impl eframe::App for EditorApp {
                     if file_btn(ui, "Reload").clicked() {
                         self.reload();
                     }
+                    if file_btn(ui, "Godot").clicked() {
+                        self.export_godot_dialog();
+                    }
+                    ui.checkbox(&mut self.auto_reload, "Auto")
+                        .on_hover_text("Reload when the .vox file changes (MCP generate / other tools)");
 
                     ui.add_space(16.0);
                     ui.separator();
@@ -522,7 +677,8 @@ impl eframe::App for EditorApp {
                             ))
                             .color(theme::MUTED)
                             .size(12.5),
-                        );
+                        )
+                        .on_hover_text(self.path.display().to_string());
                     });
                 });
             });

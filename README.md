@@ -1,6 +1,20 @@
-# Voxel Editor (Rust) + MagicaVoxel-compatible MCP
+<p align="center">
+  <img src="docs/images/app-icon.png" width="128" alt="Voxel Editor icon">
+</p>
+
+# Voxel Editor
 
 Cross-platform voxel editor inspired by [MagicaVoxel 0.99.7](https://github.com/ephtracy/ephtracy.github.io/releases/tag/0.99.7), with an **MCP server** so agents can place voxels, paint colors, fill shapes, and save `.vox` files.
+
+<p align="center">
+  <img src="docs/images/house.png" width="380" alt="House scene generated over MCP">
+  &nbsp;
+  <img src="docs/images/pikachu.png" width="240" alt="Pikachu voxel model generated over MCP">
+</p>
+
+<p align="center">
+  <em>MCP-generated examples — <code>examples/house.vox</code> and <code>examples/pikachu.vox</code></em>
+</p>
 
 > MagicaVoxel is **not open source** (binary-only). This project reimplements editor ops and `.vox` I/O from the public format docs in [ephtracy/voxel-model](https://github.com/ephtracy/voxel-model).
 
@@ -9,10 +23,11 @@ Cross-platform voxel editor inspired by [MagicaVoxel 0.99.7](https://github.com/
 | Crate | Role |
 |-------|------|
 | `voxel-core` | Grid, palette, brushes (box/sphere/flood/mirror) |
-| `voxel-vox` | MagicaVoxel `.vox` read/write (SIZE/XYZI/RGBA; skips nTRN/MATL/…) |
+| `voxel-vox` | MagicaVoxel `.vox` read/write (SIZE/XYZI/RGBA; scene graph nTRN/nGRP/nSHP) |
 | `voxel-mcp` | MCP tool surface |
 | `voxel-mcp-server` | stdio MCP binary |
-| `voxel-editor` | egui slice-view GUI (macOS / Windows / Linux) |
+| `voxel-export` | Godot 4 `.glb` + `.tscn` |
+| `voxel-editor` | egui 3D viewport + Model/World UI (macOS / Windows / Linux) |
 
 ## Build
 
@@ -25,12 +40,31 @@ Binaries:
 - `target/release/voxel-editor`
 - `target/release/voxel-mcp-server`
 
+macOS `.app` (always rebuilds both binaries, includes the MCP server):
+
+```bash
+./scripts/pack-macos.sh
+open dist/Voxel\ Editor.app
+```
+
 ## Run the editor
 
 ```bash
-VOXEL_PROJECT=./project.vox cargo run -p voxel_editor --release
+cargo run -p voxel_editor --release
 # or
 ./target/release/voxel-editor
+# or
+open dist/Voxel\ Editor.app
+```
+
+Default document (GUI and MCP share this file):
+
+`~/Documents/n2d98 Voxel Editor/project.vox`
+
+Override with `VOXEL_PROJECT=/path/to/file.vox` or by passing a `.vox` path as the first argument. Hover the filename in the top bar to see the full path.
+
+```bash
+VOXEL_PROJECT=./examples/pikachu.vox cargo run -p voxel_editor --release
 ```
 
 ### 3D viewport controls
@@ -42,8 +76,8 @@ VOXEL_PROJECT=./project.vox cargo run -p voxel_editor --release
 | RMB / Alt+LMB | Orbit |
 | MMB / Cmd+LMB | Pan |
 | Scroll | Zoom |
-| View → Z-slice panel | Optional 2D slice editor |
-| View → Reset camera | Frame the volume |
+| Slice checkbox | Optional 2D slice editor |
+| Frame | Reset camera to the volume |
 
 First launch seeds a small demo (two objects) so Model + World modes aren’t empty.
 
@@ -60,14 +94,16 @@ MCP world tools: `list_objects`, `add_object`, `duplicate_object`, `set_object_t
 
 ## MCP (Cursor / Claude / etc.)
 
-Add to MCP config (example path — adjust to your checkout):
+GUI and MCP must point at the **same** `.vox`. Default is `~/Documents/n2d98 Voxel Editor/project.vox`. After generate, the editor **Auto**-reloads that file (unsaved GUI edits are not overwritten).
+
+After `./scripts/pack-macos.sh`, merge `dist/mcp.json` into Cursor MCP settings (or `~/.cursor/mcp.json`). The packed app includes `Contents/MacOS/voxel-mcp-server`.
 
 ```json
 {
   "mcpServers": {
     "voxel-editor": {
-      "command": "/ABS/PATH/TO/Untitled/target/release/voxel-mcp-server",
-      "args": ["--project", "/ABS/PATH/TO/Untitled/project.vox", "--size", "32"],
+      "command": "/ABS/PATH/TO/n2d98-voxel-editor/target/release/voxel-mcp-server",
+      "args": ["--project", "/ABS/PATH/TO/HOME/Documents/n2d98 Voxel Editor/project.vox", "--size", "32"],
       "env": {
         "RUST_LOG": "info"
       }
@@ -90,14 +126,16 @@ Or from source without a prior release build:
         "voxel_mcp_server",
         "--",
         "--project",
-        "/ABS/PATH/TO/Untitled/project.vox"
+        "/ABS/PATH/TO/HOME/Documents/n2d98 Voxel Editor/project.vox"
       ]
     }
   }
 }
 ```
 
-### Tools (MVP)
+Coordinates follow MagicaVoxel: **X right, Y depth, Z up**. Colors are palette indices **1..=255**.
+
+### Tools
 
 | Tool | Purpose |
 |------|---------|
@@ -109,8 +147,16 @@ Or from source without a prior release build:
 | `set_active_color` / `set_palette_color` / `get_palette_color` | Palette |
 | `clear_model` / `resize_model` / `mirror_model` | Volume ops |
 | `save_vox` / `load_vox` / `reload` | Persistence |
+| `export_godot` | Godot 4 `.glb` + `.tscn` (`scope`: world \| model) |
 
-Coordinates follow MagicaVoxel: **X right, Y depth, Z up**. Colors are palette indices **1..=255**.
+## Godot export
+
+`export_godot` (or the **Godot** button) writes:
+
+- `{name}.glb` — glTF 2.0 binary, Y-up, vertex colors, unlit. 1 voxel = 1 Godot unit. World objects become separate nodes.
+- `{name}.tscn` — wrapper that instances the `.glb` at `res://{name}.glb`
+
+Drop the `.glb` into a Godot 4 project (or instance it). `scope`: `world` (default, all objects) or `model` (active model only).
 
 ## Feature roadmap (parity with MV 0.99.7)
 
@@ -120,6 +166,8 @@ Coordinates follow MagicaVoxel: **X right, Y depth, Z up**. Colors are palette i
 - [x] Slice GUI
 - [x] 3D GPU viewport (orbit + raycast paint)
 - [x] World editor scene graph (`nTRN`/`nGRP`/`nSHP`)
+- [x] Auto-reload when MCP writes the open `.vox`
+- [x] Godot 4 export
 - [ ] Materials (`MATL`), layers (`LAYR`)
 - [ ] Frame animation
 - [ ] Path-trace preview
