@@ -7,7 +7,7 @@ use rmcp::{
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use voxel_core::{BrushKind, ColorRgba, IVec3, Project};
+use voxel_core::{BrushKind, ColorRgba, IVec3, MaterialKind, Project};
 use voxel_vox::{load_path, save_path};
 
 #[derive(Clone)]
@@ -78,6 +78,7 @@ impl VoxelMcpServer {
         &self,
         Parameters(SetVoxelParams { x, y, z, color }): Parameters<SetVoxelParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.state.project.checkpoint();
         self.state
             .project
             .set_voxel(x, y, z, color)
@@ -91,6 +92,7 @@ impl VoxelMcpServer {
         &self,
         Parameters(Vec3Params { x, y, z }): Parameters<Vec3Params>,
     ) -> Result<CallToolResult, McpError> {
+        self.state.project.checkpoint();
         self.state
             .project
             .erase_voxel(x, y, z)
@@ -104,6 +106,7 @@ impl VoxelMcpServer {
         &self,
         Parameters(p): Parameters<FillBoxParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.state.project.checkpoint();
         let n = self
             .state
             .project
@@ -122,6 +125,7 @@ impl VoxelMcpServer {
         &self,
         Parameters(p): Parameters<FillSphereParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.state.project.checkpoint();
         let n = self
             .state
             .project
@@ -131,11 +135,70 @@ impl VoxelMcpServer {
         Ok(text(format!("fill_sphere changed {n} voxels")))
     }
 
+    #[tool(description = "Draw a 3D Bresenham line between two voxels (inclusive endpoints)")]
+    fn fill_line(
+        &self,
+        Parameters(p): Parameters<FillLineParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.state.project.checkpoint();
+        let n = self
+            .state
+            .project
+            .fill_line(
+                IVec3::new(p.x0, p.y0, p.z0),
+                IVec3::new(p.x1, p.y1, p.z1),
+                p.color,
+            )
+            .map_err(core_err)?;
+        self.state.persist()?;
+        Ok(text(format!("fill_line changed {n} voxels")))
+    }
+
+    #[tool(description = "Fill a disk on a plane. axis is the plane normal: x|y|z")]
+    fn fill_circle(
+        &self,
+        Parameters(p): Parameters<FillCircleParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let axis = parse_axis(&p.axis)?;
+        self.state.project.checkpoint();
+        let n = self
+            .state
+            .project
+            .fill_circle(IVec3::new(p.x, p.y, p.z), p.radius, axis, p.color)
+            .map_err(core_err)?;
+        self.state.persist()?;
+        Ok(text(format!("fill_circle changed {n} voxels")))
+    }
+
+    #[tool(
+        description = "Fill an axis-aligned rectangle on a constant-axis plane. Plane coord is a=(x0,y0,z0) on axis; the other two axes span a..=b. Example: axis=z fills x,y between the corners at z=z0."
+    )]
+    fn fill_plane(
+        &self,
+        Parameters(p): Parameters<FillPlaneParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let axis = parse_axis(&p.axis)?;
+        self.state.project.checkpoint();
+        let n = self
+            .state
+            .project
+            .fill_plane_rect(
+                IVec3::new(p.x0, p.y0, p.z0),
+                IVec3::new(p.x1, p.y1, p.z1),
+                axis,
+                p.color,
+            )
+            .map_err(core_err)?;
+        self.state.persist()?;
+        Ok(text(format!("fill_plane changed {n} voxels")))
+    }
+
     #[tool(description = "Flood-fill connected region of same color starting at (x,y,z)")]
     fn flood_fill(
         &self,
         Parameters(p): Parameters<FloodFillParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.state.project.checkpoint();
         let n = self
             .state
             .project
@@ -150,6 +213,7 @@ impl VoxelMcpServer {
         &self,
         Parameters(p): Parameters<ApplyBrushParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.state.project.checkpoint();
         let n = self
             .state
             .project
@@ -159,7 +223,7 @@ impl VoxelMcpServer {
         Ok(text(format!("apply_brush changed {n} voxels")))
     }
 
-    #[tool(description = "Configure brush: kind=voxel|box|sphere|erase|flood_fill, optional mirror axes")]
+    #[tool(description = "Configure brush: kind=voxel|box|sphere|erase|flood_fill|line|plane|circle, optional mirror axes")]
     fn set_brush(
         &self,
         Parameters(p): Parameters<BrushParams>,
@@ -189,6 +253,7 @@ impl VoxelMcpServer {
         &self,
         Parameters(p): Parameters<PaletteColorParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.state.project.checkpoint();
         self.state
             .project
             .set_palette_color(p.index, ColorRgba::new(p.r, p.g, p.b, p.a))
@@ -212,8 +277,119 @@ impl VoxelMcpServer {
         )))
     }
 
+    #[tool(description = "Get MagicaVoxel MATL material for a palette index (1..=255)")]
+    fn get_material(
+        &self,
+        Parameters(ActiveColorParams { index }): Parameters<ActiveColorParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if index == 0 {
+            return Err(McpError::invalid_params("index must be 1..=255", None));
+        }
+        let json = self
+            .state
+            .project
+            .with_inner(|p| p.scene.materials.get(index).to_json(index));
+        Ok(text(json.to_string()))
+    }
+
+    #[tool(
+        description = "Set MATL material on a palette index. type: diffuse|metal|glass|emit|blend|media. Optional weight/rough/spec/ior/att/flux (0..=1 except flux 0..=4)."
+    )]
+    fn set_material(
+        &self,
+        Parameters(p): Parameters<SetMaterialParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if p.index == 0 {
+            return Err(McpError::invalid_params("index must be 1..=255", None));
+        }
+        let kind = parse_material_kind(&p.kind)?;
+        let mut mat = self
+            .state
+            .project
+            .with_inner(|proj| proj.scene.materials.get(p.index).clone());
+        mat.kind = kind;
+        if let Some(v) = p.weight {
+            mat.weight = v.clamp(0.0, 1.0);
+        }
+        if let Some(v) = p.rough {
+            mat.rough = v.clamp(0.0, 1.0);
+        }
+        if let Some(v) = p.spec {
+            mat.spec = v.clamp(0.0, 1.0);
+        }
+        if let Some(v) = p.ior {
+            mat.ior = v.clamp(0.0, 2.0);
+        }
+        if let Some(v) = p.att {
+            mat.att = v.clamp(0.0, 1.0);
+        }
+        if let Some(v) = p.flux {
+            mat.flux = v.clamp(0.0, 4.0);
+        }
+        self.state.project.checkpoint();
+        self.state
+            .project
+            .set_material(p.index, mat)
+            .map_err(core_err)?;
+        self.state.persist()?;
+        Ok(text(format!(
+            "material[{}] = {}",
+            p.index,
+            kind.label().to_ascii_lowercase()
+        )))
+    }
+
+    #[tool(description = "List world LAYR layers: id, name, hidden, color")]
+    fn list_layers(&self) -> Result<CallToolResult, McpError> {
+        let json = self
+            .state
+            .project
+            .with_inner(|p| p.scene.layers.to_json());
+        Ok(text(json.to_string()))
+    }
+
+    #[tool(description = "Rename a layer and/or set hidden (hides all objects on that layer)")]
+    fn set_layer(
+        &self,
+        Parameters(p): Parameters<LayerUpdateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.state.project.checkpoint();
+        let ok = self.state.project.with_inner_mut(|proj| {
+            let mut any = false;
+            if let Some(name) = p.name {
+                any |= proj.scene.layers.rename(p.layer_id, name);
+            }
+            if let Some(hidden) = p.hidden {
+                any |= proj.scene.layers.set_hidden(p.layer_id, hidden);
+            }
+            any || proj.scene.layers.get(p.layer_id).is_some()
+        });
+        if !ok {
+            return Err(McpError::invalid_params("unknown layer_id", None));
+        }
+        self.state.persist()?;
+        Ok(text(format!("updated layer {}", p.layer_id)))
+    }
+
+    #[tool(description = "Assign a world object (transform node) to a LAYR layer id")]
+    fn set_object_layer(
+        &self,
+        Parameters(p): Parameters<ObjectLayerParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.state.project.checkpoint();
+        if !self.state.project.set_object_layer(p.node_id, p.layer_id) {
+            return Err(McpError::invalid_params("node is not a transform", None));
+        }
+        self.state.persist()?;
+        Ok(text(format!(
+            "node {} → layer {}",
+            p.node_id, p.layer_id
+        )))
+    }
+
     #[tool(description = "Clear all voxels in the model")]
     fn clear_model(&self) -> Result<CallToolResult, McpError> {
+        self.state.project.checkpoint();
         self.state.project.clear();
         self.state.persist()?;
         Ok(text("model cleared"))
@@ -224,6 +400,7 @@ impl VoxelMcpServer {
         &self,
         Parameters(p): Parameters<ResizeParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.state.project.checkpoint();
         self.state
             .project
             .resize(p.size_x, p.size_y, p.size_z)
@@ -244,6 +421,7 @@ impl VoxelMcpServer {
             .chars()
             .next()
             .ok_or_else(|| McpError::invalid_params("axis required", None))?;
+        self.state.project.checkpoint();
         self.state.project.mirror(ch).map_err(core_err)?;
         self.state.persist()?;
         Ok(text(format!("mirrored on {axis}")))
@@ -268,6 +446,7 @@ impl VoxelMcpServer {
         let path = PathBuf::from(path);
         let loaded = load_path(&path).map_err(internal)?;
         let snap = loaded.snapshot();
+        self.state.project.checkpoint();
         self.state.project.with_inner_mut(|p| {
             *p = snap;
         });
@@ -282,6 +461,7 @@ impl VoxelMcpServer {
         let path = self.state.path.lock().clone();
         let loaded = load_path(&path).map_err(internal)?;
         let snap = loaded.snapshot();
+        self.state.project.checkpoint();
         self.state.project.with_inner_mut(|p| {
             *p = snap;
         });
@@ -301,6 +481,39 @@ impl VoxelMcpServer {
     ) -> Result<CallToolResult, McpError> {
         self.state.project.select_node(Some(node_id));
         Ok(text(format!("selected node {node_id}")))
+    }
+
+    #[tool(description = "Delete a world object (transform instance). Cannot delete the scene root.")]
+    fn delete_object(
+        &self,
+        Parameters(NodeIdParams { node_id }): Parameters<NodeIdParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if !self.state.project.delete_object(node_id) {
+            return Err(McpError::invalid_params(
+                "cannot delete node (missing or scene root)",
+                None,
+            ));
+        }
+        self.state.persist()?;
+        Ok(text(format!("deleted node {node_id}")))
+    }
+
+    #[tool(description = "Undo the last checkpointed mutation")]
+    fn undo(&self) -> Result<CallToolResult, McpError> {
+        if !self.state.project.undo() {
+            return Ok(text("nothing to undo"));
+        }
+        self.state.persist()?;
+        Ok(text("undo"))
+    }
+
+    #[tool(description = "Redo the last undone mutation")]
+    fn redo(&self) -> Result<CallToolResult, McpError> {
+        if !self.state.project.redo() {
+            return Ok(text("nothing to redo"));
+        }
+        self.state.persist()?;
+        Ok(text("redo"))
     }
 
     #[tool(description = "Set active model index for voxel paint tools")]
@@ -338,6 +551,7 @@ impl VoxelMcpServer {
         &self,
         Parameters(p): Parameters<ObjectTranslationParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.state.project.checkpoint();
         if !self.state.project.set_object_translation(
             p.node_id,
             IVec3::new(p.x, p.y, p.z),
@@ -356,6 +570,7 @@ impl VoxelMcpServer {
         &self,
         Parameters(p): Parameters<AddObjectParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.state.project.checkpoint();
         let size = if p.size == 0 { 32 } else { p.size };
         let id = self
             .state
@@ -371,6 +586,7 @@ impl VoxelMcpServer {
         &self,
         Parameters(p): Parameters<AddObjectParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.state.project.checkpoint();
         let id = self
             .state
             .project
@@ -426,12 +642,42 @@ impl ServerHandler for VoxelMcpServer {
             instructions: Some(
                 "Voxel editor MCP (MagicaVoxel-compatible .vox) with Model + World modes. \
                  Coordinates: X right, Y depth, Z up. Colors are palette indices 1..=255. \
-                 Use set_edit_mode/list_objects/add_object/set_object_translation for the world editor. \
+                 Use set_edit_mode/list_objects/add_object/delete_object/set_object_translation for the world editor. \
+                 Use get_material/set_material for MATL (per palette index). \
+                 Use list_layers/set_layer/set_object_layer for LAYR. \
                  Voxel paint tools (set_voxel, fill_*) operate on the active model and persist the .vox; \
-                 the GUI auto-reloads that file. After generating, call export_godot to write a Godot 4 .glb."
+                 the GUI auto-reloads that file. After generating, call export_godot to write a Godot 4 .glb. \
+                 Mutating tools checkpoint once for undo/redo. Use delete_object to remove a world instance."
                     .into(),
             ),
         }
+    }
+}
+
+fn parse_axis(s: &str) -> Result<char, McpError> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "x" => Ok('x'),
+        "y" => Ok('y'),
+        "z" => Ok('z'),
+        other => Err(McpError::invalid_params(
+            format!("unknown axis '{other}' (expected x|y|z)"),
+            None,
+        )),
+    }
+}
+
+fn parse_material_kind(s: &str) -> Result<MaterialKind, McpError> {
+    match s.trim().trim_start_matches('_').to_ascii_lowercase().as_str() {
+        "diffuse" | "d" => Ok(MaterialKind::Diffuse),
+        "metal" | "m" => Ok(MaterialKind::Metal),
+        "glass" | "g" => Ok(MaterialKind::Glass),
+        "emit" | "emissive" | "e" => Ok(MaterialKind::Emit),
+        "blend" => Ok(MaterialKind::Blend),
+        "media" => Ok(MaterialKind::Media),
+        other => Err(McpError::invalid_params(
+            format!("unknown material type '{other}'"),
+            None,
+        )),
     }
 }
 
@@ -442,6 +688,9 @@ fn parse_brush_kind(s: &str) -> Result<BrushKind, McpError> {
         "sphere" | "s" => Ok(BrushKind::Sphere),
         "erase" | "e" => Ok(BrushKind::Erase),
         "flood_fill" | "flood" | "f" => Ok(BrushKind::FloodFill),
+        "line" | "l" => Ok(BrushKind::Line),
+        "plane" | "p" => Ok(BrushKind::Plane),
+        "circle" | "c" => Ok(BrushKind::Circle),
         other => Err(McpError::invalid_params(
             format!("unknown brush kind '{other}'"),
             None,

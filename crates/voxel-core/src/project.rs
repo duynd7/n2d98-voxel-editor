@@ -1,9 +1,12 @@
 use crate::brush::{self, BrushOptions, MirrorAxes};
-use crate::scene::{ModelId, NodeId, Scene, WorldInstance};
-use crate::{BrushKind, ColorIndex, ColorRgba, IVec3, Palette, Result, VoxelModel};
+use crate::scene::{ModelId, NodeId, Scene, SceneNode, WorldInstance};
+use crate::{BrushKind, ColorIndex, ColorRgba, IVec3, Material, Palette, Result, VoxelModel};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::Arc;
+
+const UNDO_CAP: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -13,13 +16,21 @@ pub enum EditMode {
     World,
 }
 
+#[derive(Default)]
+struct UndoHistory {
+    undo: VecDeque<ProjectInner>,
+    redo: VecDeque<ProjectInner>,
+}
+
 /// Shared editable document. Safe for GUI + MCP.
+/// Undo stacks live here (not in [`ProjectInner`]) so snapshots do not clone history.
 #[derive(Clone)]
 pub struct Project {
     inner: Arc<Mutex<ProjectInner>>,
+    history: Arc<Mutex<UndoHistory>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectInner {
     pub scene: Scene,
     pub palette: Palette,
@@ -47,48 +58,94 @@ impl ProjectInner {
 }
 
 impl Project {
+    fn wrap(inner: ProjectInner) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
+            history: Arc::new(Mutex::new(UndoHistory::default())),
+        }
+    }
+
     pub fn new(size: u32) -> Result<Self> {
         let scene = Scene::new_empty_world(size)?;
-        Ok(Self {
-            inner: Arc::new(Mutex::new(ProjectInner {
-                scene,
-                palette: Palette::default(),
-                active_color: 1,
-                brush: BrushOptions::default(),
-                active_model: 0,
-                selected_node: Some(0),
-                edit_mode: EditMode::Model,
-            })),
-        })
+        Ok(Self::wrap(ProjectInner {
+            scene,
+            palette: Palette::default(),
+            active_color: 1,
+            brush: BrushOptions::default(),
+            active_model: 0,
+            selected_node: Some(0),
+            edit_mode: EditMode::Model,
+        }))
     }
 
     pub fn from_parts(model: VoxelModel, palette: Palette) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(ProjectInner {
-                scene: Scene::from_single_model(model),
-                palette,
-                active_color: 1,
-                brush: BrushOptions::default(),
-                active_model: 0,
-                selected_node: Some(0),
-                edit_mode: EditMode::Model,
-            })),
-        }
+        Self::wrap(ProjectInner {
+            scene: Scene::from_single_model(model),
+            palette,
+            active_color: 1,
+            brush: BrushOptions::default(),
+            active_model: 0,
+            selected_node: Some(0),
+            edit_mode: EditMode::Model,
+        })
     }
 
     pub fn from_scene(scene: Scene, palette: Palette) -> Self {
         let selected = Some(scene.root);
-        Self {
-            inner: Arc::new(Mutex::new(ProjectInner {
-                scene,
-                palette,
-                active_color: 1,
-                brush: BrushOptions::default(),
-                active_model: 0,
-                selected_node: selected,
-                edit_mode: EditMode::World,
-            })),
+        Self::wrap(ProjectInner {
+            scene,
+            palette,
+            active_color: 1,
+            brush: BrushOptions::default(),
+            active_model: 0,
+            selected_node: selected,
+            edit_mode: EditMode::World,
+        })
+    }
+
+    /// Push a clone of the current document onto the undo stack and clear redo.
+    /// Skips if identical to the last snapshot. Caps undo at [`UNDO_CAP`].
+    pub fn checkpoint(&self) {
+        let snap = self.inner.lock().clone();
+        let mut history = self.history.lock();
+        if history.undo.back() == Some(&snap) {
+            return;
         }
+        if history.undo.len() >= UNDO_CAP {
+            history.undo.pop_front();
+        }
+        history.undo.push_back(snap);
+        history.redo.clear();
+    }
+
+    pub fn undo(&self) -> bool {
+        let mut inner = self.inner.lock();
+        let mut history = self.history.lock();
+        let Some(prev) = history.undo.pop_back() else {
+            return false;
+        };
+        history.redo.push_back(inner.clone());
+        *inner = prev;
+        true
+    }
+
+    pub fn redo(&self) -> bool {
+        let mut inner = self.inner.lock();
+        let mut history = self.history.lock();
+        let Some(next) = history.redo.pop_back() else {
+            return false;
+        };
+        history.undo.push_back(inner.clone());
+        *inner = next;
+        true
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.history.lock().undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.history.lock().redo.is_empty()
     }
 
     pub fn with_inner<R>(&self, f: impl FnOnce(&ProjectInner) -> R) -> R {
@@ -142,6 +199,46 @@ impl Project {
         })
     }
 
+    /// Checkpoint, then detach a world-editor transform instance (not the scene root).
+    pub fn delete_object(&self, node_id: NodeId) -> bool {
+        {
+            let inner = self.inner.lock();
+            if node_id == inner.scene.root {
+                return false;
+            }
+            if !matches!(
+                inner.scene.nodes.get(&node_id),
+                Some(SceneNode::Transform(_))
+            ) {
+                return false;
+            }
+        }
+        self.checkpoint();
+        self.with_inner_mut(|p| {
+            if !p.scene.remove_object(node_id) {
+                return false;
+            }
+            if p.selected_node == Some(node_id) {
+                p.selected_node = p
+                    .scene
+                    .list_objects()
+                    .into_iter()
+                    .map(|o| o.id)
+                    .next()
+                    .or(Some(p.scene.root));
+            }
+            if let Some(nid) = p.selected_node {
+                if let Some(mid) = p.scene.model_id_for_transform(nid) {
+                    p.active_model = mid;
+                }
+            }
+            if p.active_model >= p.scene.models.len() {
+                p.active_model = 0;
+            }
+            true
+        })
+    }
+
     pub fn duplicate_active_object(&self, name: &str, translation: IVec3) -> Result<NodeId> {
         self.with_inner_mut(|p| {
             let model = p.model().clone();
@@ -156,6 +253,22 @@ impl Project {
 
     pub fn set_object_translation(&self, node_id: NodeId, t: IVec3) -> bool {
         self.with_inner_mut(|p| p.scene.set_translation(node_id, t))
+    }
+
+    pub fn set_object_layer(&self, node_id: NodeId, layer_id: i32) -> bool {
+        self.with_inner_mut(|p| p.scene.set_object_layer(node_id, layer_id))
+    }
+
+    pub fn set_layer_hidden(&self, layer_id: i32, hidden: bool) -> bool {
+        self.with_inner_mut(|p| p.scene.layers.set_hidden(layer_id, hidden))
+    }
+
+    pub fn rename_layer(&self, layer_id: i32, name: String) -> bool {
+        self.with_inner_mut(|p| p.scene.layers.rename(layer_id, name))
+    }
+
+    pub fn set_material(&self, index: ColorIndex, material: Material) -> Result<()> {
+        self.with_inner_mut(|p| p.scene.materials.set(index, material))
     }
 
     pub fn instances(&self) -> Vec<WorldInstance> {
@@ -176,6 +289,30 @@ impl Project {
 
     pub fn fill_sphere(&self, center: IVec3, radius: u32, color: ColorIndex) -> Result<usize> {
         self.with_inner_mut(|p| brush::fill_sphere(p.model_mut(), center, radius, color))
+    }
+
+    pub fn fill_line(&self, a: IVec3, b: IVec3, color: ColorIndex) -> Result<usize> {
+        self.with_inner_mut(|p| brush::fill_line(p.model_mut(), a, b, color))
+    }
+
+    pub fn fill_circle(
+        &self,
+        center: IVec3,
+        radius: u32,
+        axis: char,
+        color: ColorIndex,
+    ) -> Result<usize> {
+        self.with_inner_mut(|p| brush::fill_circle(p.model_mut(), center, radius, axis, color))
+    }
+
+    pub fn fill_plane_rect(
+        &self,
+        a: IVec3,
+        b: IVec3,
+        axis: char,
+        color: ColorIndex,
+    ) -> Result<usize> {
+        self.with_inner_mut(|p| brush::fill_plane_rect(p.model_mut(), a, b, axis, color))
     }
 
     pub fn flood_fill(&self, start: IVec3, color: ColorIndex) -> Result<usize> {
@@ -231,16 +368,18 @@ impl Project {
                 .scene
                 .list_objects()
                 .into_iter()
-                .map(|(id, name, t, hidden, mid)| {
+                .map(|o| {
                     serde_json::json!({
-                        "id": id,
-                        "name": name,
-                        "translation": [t.x, t.y, t.z],
-                        "hidden": hidden,
-                        "model_id": mid,
+                        "id": o.id,
+                        "name": o.name,
+                        "translation": [o.translation.x, o.translation.y, o.translation.z],
+                        "hidden": o.hidden,
+                        "model_id": o.model_id,
+                        "layer_id": o.layer_id,
                     })
                 })
                 .collect();
+            let active_mat = p.scene.materials.get(p.active_color);
             serde_json::json!({
                 "edit_mode": p.edit_mode,
                 "active_model": p.active_model,
@@ -251,7 +390,38 @@ impl Project {
                 "active_color": p.active_color,
                 "brush": p.brush,
                 "objects": objects,
+                "layers": p.scene.layers.to_json(),
+                "material": active_mat.to_json(p.active_color),
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn undo_restores_a_voxel() {
+        let project = Project::new(8).unwrap();
+        project.checkpoint();
+        project.set_voxel(1, 2, 3, 7).unwrap();
+        assert_eq!(
+            project.with_inner(|p| p.model().get(1, 2, 3).unwrap()),
+            7
+        );
+        assert!(project.can_undo());
+        assert!(!project.can_redo());
+        assert!(project.undo());
+        assert_eq!(
+            project.with_inner(|p| p.model().get(1, 2, 3).unwrap()),
+            0
+        );
+        assert!(project.can_redo());
+        assert!(project.redo());
+        assert_eq!(
+            project.with_inner(|p| p.model().get(1, 2, 3).unwrap()),
+            7
+        );
     }
 }

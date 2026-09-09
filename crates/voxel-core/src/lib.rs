@@ -3,18 +3,22 @@
 //! — MagicaVoxel itself is closed-source; we reimplement from public .vox docs.
 
 mod brush;
+mod layer;
+mod material;
 mod model;
 mod palette;
 mod project;
 mod scene;
 
 pub use brush::{BrushKind, BrushOptions, MirrorAxes};
+pub use layer::{Layer, LayerTable, DEFAULT_LAYER_COUNT};
+pub use material::{Material, MaterialKind, MaterialTable};
 pub use model::{IVec3, VoxelModel};
 pub use palette::{ColorRgba, Palette};
 pub use project::{EditMode, Project, ProjectInner};
 pub use scene::{
-    local_to_world, world_to_local, GroupNode, ModelId, MvRotation, NodeId, Scene, SceneNode,
-    ShapeNode, TransformNode, WorldInstance,
+    local_to_world, world_to_local, GroupNode, ModelId, MvRotation, NodeId, ObjectRef, Scene,
+    SceneNode, ShapeNode, TransformNode, WorldInstance,
 };
 
 pub type ColorIndex = u8;

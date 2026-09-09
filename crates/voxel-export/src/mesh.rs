@@ -1,6 +1,6 @@
 //! Face-culled voxel mesh in MagicaVoxel space, then converted to glTF Y-up.
 
-use voxel_core::{local_to_world, IVec3, MvRotation, Palette, VoxelModel};
+use voxel_core::{local_to_world, IVec3, MaterialTable, MvRotation, Palette, VoxelModel};
 
 pub struct CpuMesh {
     pub name: String,
@@ -89,6 +89,7 @@ pub fn build_local_mesh(
     name: impl Into<String>,
     model: &VoxelModel,
     palette: &Palette,
+    materials: &MaterialTable,
     translation: IVec3,
     rotation: MvRotation,
 ) -> CpuMesh {
@@ -107,12 +108,7 @@ pub fn build_local_mesh(
                     continue;
                 }
                 let c = palette.get(idx);
-                let color = [
-                    c.r as f32 / 255.0,
-                    c.g as f32 / 255.0,
-                    c.b as f32 / 255.0,
-                    c.a as f32 / 255.0,
-                ];
+                let color = materials.get(idx).viewport_rgba(c);
 
                 for (normal, corners, (dx, dy, dz)) in FACES {
                     if model.get_or_empty(x + dx, y + dy, z + dz) != 0 {

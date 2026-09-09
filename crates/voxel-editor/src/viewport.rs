@@ -36,7 +36,8 @@ struct ViewportGpu {
     vao: glow::VertexArray,
     vbo: glow::Buffer,
     ebo: glow::Buffer,
-    index_count: i32,
+    opaque_count: i32,
+    transparent_count: i32,
     guide_bufs: Vec<LineBuf>,
     cursor_buf: LineBuf,
     ghost_vao: glow::VertexArray,
@@ -45,6 +46,7 @@ struct ViewportGpu {
     ghost_count: i32,
     u_mvp: glow::UniformLocation,
     u_light: glow::UniformLocation,
+    u_eye: glow::UniformLocation,
     u_line_mvp: glow::UniformLocation,
     u_line_color: glow::UniformLocation,
     u_alpha: Option<glow::UniformLocation>,
@@ -68,7 +70,9 @@ impl ViewportGpu {
             gl.enable_vertex_attrib_array(1);
             gl.vertex_attrib_pointer_f32(1, 3, glow::FLOAT, false, stride, 12);
             gl.enable_vertex_attrib_array(2);
-            gl.vertex_attrib_pointer_f32(2, 3, glow::FLOAT, false, stride, 24);
+            gl.vertex_attrib_pointer_f32(2, 4, glow::FLOAT, false, stride, 24);
+            gl.enable_vertex_attrib_array(3);
+            gl.vertex_attrib_pointer_f32(3, 3, glow::FLOAT, false, stride, 40);
             gl.bind_vertex_array(None);
             Ok((vao, vbo, ebo))
         };
@@ -98,6 +102,9 @@ impl ViewportGpu {
         let u_light = gl
             .get_uniform_location(program, "u_light")
             .ok_or_else(|| "u_light missing".to_string())?;
+        let u_eye = gl
+            .get_uniform_location(program, "u_eye")
+            .ok_or_else(|| "u_eye missing".to_string())?;
         let u_alpha = gl.get_uniform_location(program, "u_alpha");
         let u_line_mvp = gl
             .get_uniform_location(line_program, "u_mvp")
@@ -112,7 +119,8 @@ impl ViewportGpu {
             vao,
             vbo,
             ebo,
-            index_count: 0,
+            opaque_count: 0,
+            transparent_count: 0,
             guide_bufs: Vec::new(),
             cursor_buf: make_line(gl)?,
             ghost_vao,
@@ -121,6 +129,7 @@ impl ViewportGpu {
             ghost_count: 0,
             u_mvp,
             u_light,
+            u_eye,
             u_line_mvp,
             u_line_color,
             u_alpha,
@@ -128,8 +137,10 @@ impl ViewportGpu {
     }
 
     unsafe fn upload_mesh(&mut self, gl: &glow::Context, mesh: &MeshData) {
-        upload_indexed(gl, self.vao, self.vbo, self.ebo, mesh);
-        self.index_count = mesh.indices.len() as i32;
+        let indices = concat_indices(mesh);
+        upload_indexed(gl, self.vao, self.vbo, self.ebo, &mesh.vertices, &indices);
+        self.opaque_count = mesh.opaque_indices.len() as i32;
+        self.transparent_count = mesh.transparent_indices.len() as i32;
     }
 
     unsafe fn upload_guides(&mut self, gl: &glow::Context, layers: &[LineLayer]) {
@@ -167,8 +178,16 @@ impl ViewportGpu {
 
     unsafe fn upload_ghost(&mut self, gl: &glow::Context, mesh: Option<&MeshData>) {
         if let Some(mesh) = mesh {
-            upload_indexed(gl, self.ghost_vao, self.ghost_vbo, self.ghost_ebo, mesh);
-            self.ghost_count = mesh.indices.len() as i32;
+            let indices = concat_indices(mesh);
+            upload_indexed(
+                gl,
+                self.ghost_vao,
+                self.ghost_vbo,
+                self.ghost_ebo,
+                &mesh.vertices,
+                &indices,
+            );
+            self.ghost_count = indices.len() as i32;
         } else {
             self.ghost_count = 0;
         }
@@ -185,6 +204,9 @@ impl ViewportGpu {
         let aspect = (vp.width() / vp.height().max(1.0)).max(0.01);
         let mvp = camera.view_proj(aspect);
 
+        let eye = camera.eye();
+        let mvp_arr = mvp.to_cols_array();
+
         let depth_was = gl.is_enabled(glow::DEPTH_TEST);
         let cull_was = gl.is_enabled(glow::CULL_FACE);
         let blend_was = gl.is_enabled(glow::BLEND);
@@ -195,26 +217,22 @@ impl ViewportGpu {
         gl.enable(glow::CULL_FACE);
         gl.cull_face(glow::BACK);
         gl.disable(glow::BLEND);
+        gl.depth_mask(true);
 
         gl.clear_color(0.09, 0.10, 0.12, 1.0);
         gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
 
-        // Solids
-        if self.index_count > 0 {
-            gl.use_program(Some(self.program));
-            gl.uniform_matrix_4_f32_slice(Some(&self.u_mvp), false, &mvp.to_cols_array());
-            gl.uniform_3_f32(Some(&self.u_light), 0.35, -0.55, 0.75);
-            if let Some(u) = &self.u_alpha {
-                gl.uniform_1_f32(Some(u), 1.0);
-            }
+        // Opaque solids — depth write on, blend off
+        if self.opaque_count > 0 {
+            self.bind_solid(gl, &mvp_arr, eye, [0.35, -0.55, 0.75], 1.0);
             gl.bind_vertex_array(Some(self.vao));
-            gl.draw_elements(glow::TRIANGLES, self.index_count, glow::UNSIGNED_INT, 0);
+            gl.draw_elements(glow::TRIANGLES, self.opaque_count, glow::UNSIGNED_INT, 0);
             gl.bind_vertex_array(None);
         }
 
-        // Guides (grid / bounds / axes) — depth on
+        // Guides (grid / bounds / axes) — depth on, before glass so they show through
         gl.use_program(Some(self.line_program));
-        gl.uniform_matrix_4_f32_slice(Some(&self.u_line_mvp), false, &mvp.to_cols_array());
+        gl.uniform_matrix_4_f32_slice(Some(&self.u_line_mvp), false, &mvp_arr);
         for buf in &self.guide_bufs {
             if buf.count <= 0 {
                 continue;
@@ -224,18 +242,31 @@ impl ViewportGpu {
             gl.draw_arrays(glow::LINES, 0, buf.count);
         }
 
-        // Ghost cube (translucent)
+        // Transparent solids (glass / media) — blend, depth test, no depth write
+        if self.transparent_count > 0 {
+            gl.enable(glow::BLEND);
+            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            gl.depth_mask(false);
+            self.bind_solid(gl, &mvp_arr, eye, [0.35, -0.55, 0.75], 1.0);
+            gl.bind_vertex_array(Some(self.vao));
+            gl.draw_elements(
+                glow::TRIANGLES,
+                self.transparent_count,
+                glow::UNSIGNED_INT,
+                self.opaque_count * 4,
+            );
+            gl.bind_vertex_array(None);
+            gl.depth_mask(true);
+            gl.disable(glow::BLEND);
+        }
+
+        // Ghost cube (translucent cursor overlay)
         if self.ghost_count > 0 {
             gl.enable(glow::BLEND);
             gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
             gl.depth_mask(false);
             gl.disable(glow::CULL_FACE);
-            gl.use_program(Some(self.program));
-            gl.uniform_matrix_4_f32_slice(Some(&self.u_mvp), false, &mvp.to_cols_array());
-            gl.uniform_3_f32(Some(&self.u_light), 0.2, -0.4, 0.9);
-            if let Some(u) = &self.u_alpha {
-                gl.uniform_1_f32(Some(u), ghost_alpha.clamp(0.05, 1.0));
-            }
+            self.bind_solid(gl, &mvp_arr, eye, [0.2, -0.4, 0.9], ghost_alpha.clamp(0.05, 1.0));
             gl.bind_vertex_array(Some(self.ghost_vao));
             gl.draw_elements(glow::TRIANGLES, self.ghost_count, glow::UNSIGNED_INT, 0);
             gl.bind_vertex_array(None);
@@ -248,7 +279,7 @@ impl ViewportGpu {
         if self.cursor_buf.count > 0 {
             gl.disable(glow::DEPTH_TEST);
             gl.use_program(Some(self.line_program));
-            gl.uniform_matrix_4_f32_slice(Some(&self.u_line_mvp), false, &mvp.to_cols_array());
+            gl.uniform_matrix_4_f32_slice(Some(&self.u_line_mvp), false, &mvp_arr);
             let c = self.cursor_buf.color;
             gl.uniform_3_f32(Some(&self.u_line_color), c[0], c[1], c[2]);
             gl.bind_vertex_array(Some(self.cursor_buf.vao));
@@ -257,6 +288,7 @@ impl ViewportGpu {
             gl.enable(glow::DEPTH_TEST);
         }
 
+        gl.depth_mask(true);
         gl.use_program(None);
         if !depth_was {
             gl.disable(glow::DEPTH_TEST);
@@ -287,6 +319,31 @@ impl ViewportGpu {
             gl.delete_buffer(buf.vbo);
         }
     }
+
+    unsafe fn bind_solid(
+        &self,
+        gl: &glow::Context,
+        mvp: &[f32; 16],
+        eye: glam::Vec3,
+        light: [f32; 3],
+        alpha: f32,
+    ) {
+        gl.use_program(Some(self.program));
+        gl.uniform_matrix_4_f32_slice(Some(&self.u_mvp), false, mvp);
+        gl.uniform_3_f32(Some(&self.u_light), light[0], light[1], light[2]);
+        gl.uniform_3_f32(Some(&self.u_eye), eye.x, eye.y, eye.z);
+        if let Some(u) = &self.u_alpha {
+            gl.uniform_1_f32(Some(u), alpha);
+        }
+    }
+}
+
+fn concat_indices(mesh: &MeshData) -> Vec<u32> {
+    let mut indices =
+        Vec::with_capacity(mesh.opaque_indices.len() + mesh.transparent_indices.len());
+    indices.extend_from_slice(&mesh.opaque_indices);
+    indices.extend_from_slice(&mesh.transparent_indices);
+    indices
 }
 
 unsafe fn upload_indexed(
@@ -294,20 +351,18 @@ unsafe fn upload_indexed(
     vao: glow::VertexArray,
     vbo: glow::Buffer,
     ebo: glow::Buffer,
-    mesh: &MeshData,
+    vertices: &[Vertex],
+    indices: &[u32],
 ) {
     gl.bind_vertex_array(Some(vao));
     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
     gl.buffer_data_u8_slice(
         glow::ARRAY_BUFFER,
-        Vertex::as_bytes(&mesh.vertices),
+        Vertex::as_bytes(vertices),
         glow::DYNAMIC_DRAW,
     );
     gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ebo));
-    let index_bytes = std::slice::from_raw_parts(
-        mesh.indices.as_ptr() as *const u8,
-        mesh.indices.len() * 4,
-    );
+    let index_bytes = std::slice::from_raw_parts(indices.as_ptr() as *const u8, indices.len() * 4);
     gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, index_bytes, glow::DYNAMIC_DRAW);
     gl.bind_vertex_array(None);
 }
@@ -413,6 +468,7 @@ unsafe fn create_program(
     gl.bind_attrib_location(program, 0, "a_pos");
     gl.bind_attrib_location(program, 1, "a_normal");
     gl.bind_attrib_location(program, 2, "a_color");
+    gl.bind_attrib_location(program, 3, "a_mat");
     gl.link_program(program);
     if !gl.get_program_link_status(program) {
         return Err(gl.get_program_info_log(program));
@@ -441,30 +497,60 @@ unsafe fn compile_shader(
 const SOLID_VS: &str = r#"#version 150
 in vec3 a_pos;
 in vec3 a_normal;
-in vec3 a_color;
+in vec4 a_color;
+in vec3 a_mat;
 uniform mat4 u_mvp;
+out vec3 v_pos;
 out vec3 v_normal;
-out vec3 v_color;
+out vec4 v_color;
+out vec3 v_mat;
 void main() {
+    v_pos = a_pos;
     v_normal = a_normal;
     v_color = a_color;
+    v_mat = a_mat;
     gl_Position = u_mvp * vec4(a_pos, 1.0);
 }
 "#;
 
 const SOLID_FS: &str = r#"#version 150
+in vec3 v_pos;
 in vec3 v_normal;
-in vec3 v_color;
+in vec4 v_color;
+in vec3 v_mat;
 uniform vec3 u_light;
+uniform vec3 u_eye;
 uniform float u_alpha;
 out vec4 out_color;
 void main() {
-    float ndl = max(dot(normalize(v_normal), normalize(u_light)), 0.0);
-    float ambient = 0.28;
-    float shade = ambient + (1.0 - ambient) * ndl;
-    float a = u_alpha;
-    if (a <= 0.0) a = 1.0;
-    out_color = vec4(v_color * shade, a);
+    vec3 n = normalize(v_normal);
+    vec3 albedo = v_color.rgb;
+    float emit = v_mat.x;
+    float metal = v_mat.y;
+    float rough = clamp(v_mat.z, 0.04, 1.0);
+    vec3 col;
+    if (emit > 0.001) {
+        col = albedo + albedo * emit;
+    } else {
+        vec3 l = normalize(u_light);
+        float ndl = max(dot(n, l), 0.0);
+        float ambient = 0.28;
+        float shade = ambient + (1.0 - ambient) * ndl;
+        col = albedo * shade;
+        if (metal > 0.001) {
+            vec3 view = normalize(u_eye - v_pos);
+            vec3 h = normalize(l + view);
+            float ndh = max(dot(n, h), 0.0);
+            float shininess = mix(8.0, 72.0, 1.0 - rough);
+            float spec = pow(ndh, shininess) * metal * mix(0.25, 1.0, 1.0 - rough);
+            col += mix(vec3(spec), albedo * spec, 0.65);
+        }
+    }
+    col = clamp(col, 0.0, 1.0);
+    float ua = u_alpha;
+    if (ua <= 0.0) ua = 1.0;
+    float a = v_color.a * ua;
+    out_color = vec4(col, a);
 }
 "#;
 

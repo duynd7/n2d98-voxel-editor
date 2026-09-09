@@ -1,6 +1,6 @@
 use crate::dict::write_dict;
 use crate::Result;
-use voxel_core::{Palette, Scene, SceneNode, VoxelModel};
+use voxel_core::{Layer, Material, Palette, Scene, SceneNode, VoxelModel};
 
 /// Write MagicaVoxel-compatible .vox with models + scene graph.
 pub fn write_vox_scene(scene: &Scene, palette: &Palette) -> Result<Vec<u8>> {
@@ -18,6 +18,13 @@ pub fn write_vox_scene(scene: &Scene, palette: &Palette) -> Result<Vec<u8>> {
         if let Some(node) = scene.nodes.get(&id) {
             children.extend_from_slice(&encode_node(node));
         }
+    }
+
+    for (id, mat) in scene.materials.iter_non_default() {
+        children.extend_from_slice(&encode_matl(id, mat));
+    }
+    for layer in &scene.layers.layers {
+        children.extend_from_slice(&encode_layr(layer));
     }
 
     let main = encode_chunk(b"MAIN", &[], &children);
@@ -53,6 +60,31 @@ fn encode_rgba(palette: &Palette) -> Vec<u8> {
     }
     b.extend_from_slice(&[0, 0, 0, 0]);
     encode_chunk(b"RGBA", &b, &[])
+}
+
+fn encode_matl(id: u8, mat: &Material) -> Vec<u8> {
+    let mut content = Vec::new();
+    content.extend_from_slice(&(id as i32).to_le_bytes());
+    let owned = mat.to_dict();
+    let refs: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    write_dict(&mut content, &refs);
+    encode_chunk(b"MATL", &content, &[])
+}
+
+fn encode_layr(layer: &Layer) -> Vec<u8> {
+    let mut content = Vec::new();
+    content.extend_from_slice(&layer.id.to_le_bytes());
+    let hidden = if layer.hidden { "1" } else { "0" };
+    let color = format!("{} {} {}", layer.color[0], layer.color[1], layer.color[2]);
+    let mut attrs: Vec<(&str, &str)> = Vec::new();
+    if !layer.name.is_empty() {
+        attrs.push(("_name", layer.name.as_str()));
+    }
+    attrs.push(("_hidden", hidden));
+    attrs.push(("_color", color.as_str()));
+    write_dict(&mut content, &attrs);
+    content.extend_from_slice(&(-1_i32).to_le_bytes());
+    encode_chunk(b"LAYR", &content, &[])
 }
 
 fn encode_node(node: &SceneNode) -> Vec<u8> {

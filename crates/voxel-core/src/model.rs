@@ -15,7 +15,7 @@ impl IVec3 {
 }
 
 /// Dense voxel volume. Value 0 = empty; 1..=255 = palette index.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoxelModel {
     size_x: u32,
     size_y: u32,

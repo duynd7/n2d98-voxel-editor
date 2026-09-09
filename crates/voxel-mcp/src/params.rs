@@ -39,6 +39,41 @@ pub struct FillSphereParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FillLineParams {
+    pub x0: i32,
+    pub y0: i32,
+    pub z0: i32,
+    pub x1: i32,
+    pub y1: i32,
+    pub z1: i32,
+    pub color: u8,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FillCircleParams {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub radius: u32,
+    /// Plane normal: x | y | z
+    pub axis: String,
+    pub color: u8,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FillPlaneParams {
+    pub x0: i32,
+    pub y0: i32,
+    pub z0: i32,
+    pub x1: i32,
+    pub y1: i32,
+    pub z1: i32,
+    /// Plane normal: x | y | z
+    pub axis: String,
+    pub color: u8,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FloodFillParams {
     pub x: i32,
     pub y: i32,
@@ -68,7 +103,7 @@ pub struct ActiveColorParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BrushParams {
-    /// voxel | box | sphere | erase | flood_fill
+    /// voxel | box | sphere | erase | flood_fill | line | plane | circle
     pub kind: String,
     #[serde(default)]
     pub radius: u32,
@@ -146,6 +181,42 @@ pub struct ExportGodotParams {
     /// world (all objects, default) | model (active model only)
     #[serde(default)]
     pub scope: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetMaterialParams {
+    /// Palette index 1..=255
+    pub index: u8,
+    /// diffuse | metal | glass | emit | blend | media
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub weight: Option<f32>,
+    #[serde(default)]
+    pub rough: Option<f32>,
+    #[serde(default)]
+    pub spec: Option<f32>,
+    #[serde(default)]
+    pub ior: Option<f32>,
+    #[serde(default)]
+    pub att: Option<f32>,
+    #[serde(default)]
+    pub flux: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LayerUpdateParams {
+    pub layer_id: i32,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub hidden: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ObjectLayerParams {
+    pub node_id: i32,
+    pub layer_id: i32,
 }
 
 impl BrushParams {

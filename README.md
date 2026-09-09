@@ -23,7 +23,7 @@ Cross-platform voxel editor inspired by [MagicaVoxel 0.99.7](https://github.com/
 | Crate | Role |
 |-------|------|
 | `voxel-core` | Grid, palette, brushes (box/sphere/flood/mirror) |
-| `voxel-vox` | MagicaVoxel `.vox` read/write (SIZE/XYZI/RGBA; scene graph nTRN/nGRP/nSHP) |
+| `voxel-vox` | MagicaVoxel `.vox` read/write (SIZE/XYZI/RGBA; scene graph nTRN/nGRP/nSHP; MATL; LAYR) |
 | `voxel-mcp` | MCP tool surface |
 | `voxel-mcp-server` | stdio MCP binary |
 | `voxel-export` | Godot 4 `.glb` + `.tscn` |
@@ -73,6 +73,11 @@ VOXEL_PROJECT=./examples/pikachu.vox cargo run -p voxel_editor --release
 |-------|--------|
 | LMB | Paint (raycast onto voxels / volume) |
 | Shift+LMB | Erase hit voxel |
+| **Place** / **Overpaint** | Place paints the empty neighbor; Overpaint recolors the solid under the cursor |
+| DRAW tools | Voxel = single cell. Line / Plane / Circle / Cube / Sphere: click two cells (or click-drag) to commit. Esc or Voxel cancels a pending anchor |
+| ⌘Z / Ctrl+Z | Undo |
+| ⌘⇧Z / Ctrl+Shift+Z / Ctrl+Y | Redo |
+| Delete / Backspace | World mode: delete selected object (not voxels; not the scene root) |
 | RMB / Alt+LMB | Orbit |
 | MMB / Cmd+LMB | Pan |
 | Scroll | Zoom |
@@ -86,11 +91,13 @@ First launch seeds a small demo (two objects) so Model + World modes aren’t em
 | Mode | Behavior |
 |------|----------|
 | **Model** | Edit the active voxel volume (like MagicaVoxel model editor) |
-| **World** | Scene graph of objects; click to select; translate / add / duplicate |
+| **World** | Scene graph of objects; click to select; translate / add / duplicate / delete |
 
 World objects are stored as MagicaVoxel `nTRN` / `nGRP` / `nSHP` in `.vox`.
 
-MCP world tools: `list_objects`, `add_object`, `duplicate_object`, `set_object_translation`, `select_object`, `set_active_model`, `set_edit_mode`.
+MCP world tools: `list_objects`, `add_object`, `duplicate_object`, `delete_object`, `set_object_translation`, `select_object`, `set_active_model`, `set_edit_mode`, `list_layers`, `set_layer`, `set_object_layer`, `undo`, `redo`.
+
+Materials are per palette index (`get_material` / `set_material`). Hidden layers hide every object assigned to them.
 
 ## MCP (Cursor / Claude / etc.)
 
@@ -142,9 +149,13 @@ Coordinates follow MagicaVoxel: **X right, Y depth, Z up**. Colors are palette i
 | `get_scene_info` | Size, voxel count, brush |
 | `list_voxels` | Occupied voxels (truncated if huge) |
 | `set_voxel` / `erase_voxel` | Single cell |
-| `fill_box` / `fill_sphere` / `flood_fill` | Shapes |
+| `fill_box` / `fill_sphere` / `fill_line` / `fill_circle` / `fill_plane` / `flood_fill` | Shapes |
+| `undo` / `redo` | Session history (mutating tools checkpoint) |
+| `delete_object` | Remove a world transform (not scene root) |
 | `set_brush` / `apply_brush` | MagicaVoxel-like brush + mirror |
 | `set_active_color` / `set_palette_color` / `get_palette_color` | Palette |
+| `get_material` / `set_material` | MagicaVoxel `MATL` (per palette index) |
+| `list_layers` / `set_layer` / `set_object_layer` | MagicaVoxel `LAYR` |
 | `clear_model` / `resize_model` / `mirror_model` | Volume ops |
 | `save_vox` / `load_vox` / `reload` | Persistence |
 | `export_godot` | Godot 4 `.glb` + `.tscn` (`scope`: world \| model) |
@@ -168,11 +179,12 @@ Drop the `.glb` into a Godot 4 project (or instance it). `scope`: `world` (defau
 - [x] World editor scene graph (`nTRN`/`nGRP`/`nSHP`)
 - [x] Auto-reload when MCP writes the open `.vox`
 - [x] Godot 4 export
-- [ ] Materials (`MATL`), layers (`LAYR`)
+- [x] Materials (`MATL`), layers (`LAYR`)
+- [x] Undo / redo, overpaint, shape tools, delete object
 - [ ] Frame animation
 - [ ] Path-trace preview
 - [ ] Pattern / face / sculpt brushes
-- [ ] Object rotation gizmos / delete object UI
+- [ ] Object rotation gizmos
 
 ## License
 

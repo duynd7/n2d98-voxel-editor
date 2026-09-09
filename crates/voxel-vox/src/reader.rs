@@ -2,8 +2,8 @@ use crate::dict::{dict_get_i32, dict_get_ivec3, read_dict};
 use crate::{default_palette_from_bytes, Result, VoxError};
 use std::collections::HashMap;
 use voxel_core::{
-    GroupNode, IVec3, MvRotation, NodeId, Palette, Scene, SceneNode, ShapeNode, TransformNode,
-    VoxelModel,
+    GroupNode, IVec3, Layer, LayerTable, Material, MaterialKind, MaterialTable, MvRotation, NodeId,
+    Palette, Scene, SceneNode, ShapeNode, TransformNode, VoxelModel,
 };
 
 pub fn read_vox_scene(data: &[u8]) -> Result<(Scene, Palette)> {
@@ -33,6 +33,8 @@ pub fn read_vox_scene(data: &[u8]) -> Result<(Scene, Palette)> {
     let mut palette = Palette::magicavoxel_default();
     let mut nodes: HashMap<NodeId, SceneNode> = HashMap::new();
     let mut max_id = -1_i32;
+    let mut materials = MaterialTable::default();
+    let mut layers: Vec<Layer> = Vec::new();
 
     while offset < children_end {
         let chunk = read_chunk_header(data, &mut offset)?;
@@ -81,8 +83,24 @@ pub fn read_vox_scene(data: &[u8]) -> Result<(Scene, Palette)> {
                 max_id = max_id.max(node.id);
                 nodes.insert(node.id, SceneNode::Shape(node));
             }
-            b"PACK" | b"MATL" | b"MATT" | b"LAYR" | b"rOBJ" | b"rCAM" | b"NOTE" | b"IMAP"
-            | b"META" => {}
+            b"MATL" => {
+                if let Ok((id, mat)) = parse_matl(content) {
+                    materials.insert_id(id, mat);
+                }
+            }
+            b"MATT" => {
+                if let Ok((id, mat)) = parse_matt(content) {
+                    if (1..=255).contains(&id) && materials.get(id as u8).is_default() {
+                        materials.insert_id(id, mat);
+                    }
+                }
+            }
+            b"LAYR" => {
+                if let Ok(layer) = parse_layr(content) {
+                    layers.push(layer);
+                }
+            }
+            b"PACK" | b"rOBJ" | b"rCAM" | b"NOTE" | b"IMAP" | b"META" => {}
             _ => {}
         }
         offset = after_children;
@@ -99,9 +117,14 @@ pub fn read_vox_scene(data: &[u8]) -> Result<(Scene, Palette)> {
         models.push(VoxelModel::from_sparse(sx, sy, sz, xyzi[i].iter().copied())?);
     }
 
+    let layer_table = LayerTable::from_layers(layers);
+
     let scene = if nodes.is_empty() {
         // Legacy file: one transform per model under a root group
-        build_default_scene(models)
+        let mut scene = build_default_scene(models);
+        scene.layers = layer_table;
+        scene.materials = materials;
+        scene
     } else {
         let root = find_root(&nodes).unwrap_or(0);
         Scene {
@@ -109,6 +132,8 @@ pub fn read_vox_scene(data: &[u8]) -> Result<(Scene, Palette)> {
             nodes,
             root,
             next_id: max_id + 1,
+            layers: layer_table,
+            materials,
         }
     };
 
@@ -124,6 +149,8 @@ fn build_default_scene(models: Vec<VoxelModel>) -> Scene {
         nodes: HashMap::new(),
         root: 0,
         next_id: 1,
+        layers: LayerTable::default(),
+        materials: MaterialTable::default(),
     };
     let group_id = scene.alloc_id();
     let mut children = Vec::new();
@@ -289,6 +316,111 @@ fn parse_nshp(content: &[u8]) -> Result<ShapeNode> {
         model_ids.push(mid);
     }
     Ok(ShapeNode { id, model_ids })
+}
+
+fn parse_matl(content: &[u8]) -> Result<(i32, Material)> {
+    let mut o = 0usize;
+    if content.len() < 4 {
+        return Err(VoxError::BadChunk("MATL"));
+    }
+    let id = i32::from_le_bytes(content[o..o + 4].try_into().unwrap());
+    o += 4;
+    let props = read_dict(content, &mut o)?;
+    Ok((id, Material::from_dict(&props)))
+}
+
+/// Legacy MagicaVoxel 0.98 `MATT` → MATL-equivalent.
+fn parse_matt(content: &[u8]) -> Result<(i32, Material)> {
+    if content.len() < 16 {
+        return Err(VoxError::BadChunk("MATT"));
+    }
+    let id = i32::from_le_bytes(content[0..4].try_into().unwrap());
+    let ty = i32::from_le_bytes(content[4..8].try_into().unwrap());
+    let weight = f32::from_le_bytes(content[8..12].try_into().unwrap());
+    let bits = u32::from_le_bytes(content[12..16].try_into().unwrap());
+    let mut o = 16usize;
+    let mut values = [0.0_f32; 8];
+    for i in 0..8 {
+        let has = (bits & (1 << i)) != 0;
+        if has && i != 7 {
+            if o + 4 > content.len() {
+                break;
+            }
+            values[i] = f32::from_le_bytes(content[o..o + 4].try_into().unwrap());
+            o += 4;
+        }
+    }
+    let kind = match ty {
+        1 => MaterialKind::Metal,
+        2 => MaterialKind::Glass,
+        3 => MaterialKind::Emit,
+        _ => MaterialKind::Diffuse,
+    };
+    let mut mat = Material {
+        kind,
+        weight,
+        ..Material::default()
+    };
+    // bit0 plastic, 1 roughness, 2 specular, 3 ior, 4 att, 5 power/flux, 6 glow
+    if (bits & (1 << 1)) != 0 {
+        mat.rough = values[1];
+    }
+    if (bits & (1 << 2)) != 0 {
+        mat.spec = values[2];
+    }
+    if (bits & (1 << 3)) != 0 {
+        mat.ior = values[3];
+    }
+    if (bits & (1 << 4)) != 0 {
+        mat.att = values[4];
+    }
+    if (bits & (1 << 5)) != 0 {
+        mat.flux = values[5] * 4.0;
+    }
+    if (bits & (1 << 0)) != 0 {
+        mat.extra.insert("_plastic".into(), "1".into());
+    }
+    if (bits & (1 << 6)) != 0 {
+        mat.extra.insert("_glow".into(), format!("{}", values[6]));
+    }
+    Ok((id, mat))
+}
+
+fn parse_layr(content: &[u8]) -> Result<Layer> {
+    let mut o = 0usize;
+    if content.len() < 4 {
+        return Err(VoxError::BadChunk("LAYR"));
+    }
+    let id = i32::from_le_bytes(content[o..o + 4].try_into().unwrap());
+    o += 4;
+    let attrs = read_dict(content, &mut o)?;
+    if o + 4 <= content.len() {
+        let _reserved = i32::from_le_bytes(content[o..o + 4].try_into().unwrap());
+    }
+    let name = attrs.get("_name").cloned().unwrap_or_default();
+    let hidden = attrs.get("_hidden").map(|v| v != "0").unwrap_or(false);
+    let color = attrs
+        .get("_color")
+        .and_then(|s| parse_rgb(s))
+        .unwrap_or_else(|| Layer::new(id).color);
+    Ok(Layer {
+        id,
+        name,
+        hidden,
+        color,
+    })
+}
+
+fn parse_rgb(s: &str) -> Option<[u8; 3]> {
+    let parts: Vec<_> = s.split_whitespace().collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    Some([
+        parts[0].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[2].parse().ok()?,
+    ])
 }
 
 struct ChunkHeader {

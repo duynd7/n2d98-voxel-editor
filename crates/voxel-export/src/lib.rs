@@ -92,6 +92,7 @@ fn collect_meshes(project: &Project, scope: ExportScope) -> Vec<mesh::CpuMesh> {
                 "model",
                 snap.model(),
                 &snap.palette,
+                &snap.scene.materials,
                 voxel_core::IVec3::new(0, 0, 0),
                 voxel_core::MvRotation::IDENTITY,
             )]
@@ -123,6 +124,7 @@ fn collect_meshes(project: &Project, scope: ExportScope) -> Vec<mesh::CpuMesh> {
                     name,
                     model,
                     &snap.palette,
+                    &snap.scene.materials,
                     inst.translation,
                     inst.rotation,
                 ));

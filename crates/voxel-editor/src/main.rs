@@ -12,7 +12,7 @@ use glam::Vec2;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use viewport::{LineLayer, OverlayFrame, Viewport3D};
-use voxel_core::{local_to_world, ColorIndex, EditMode, IVec3, Project};
+use voxel_core::{local_to_world, ColorIndex, ColorRgba, EditMode, IVec3, MaterialKind, Project};
 use voxel_export::ExportScope;
 use voxel_vox::{load_path, save_path};
 
@@ -92,6 +92,73 @@ struct HoverCell {
     from_solid: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaintMode {
+    Place,
+    Overpaint,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DrawTool {
+    Voxel,
+    Line,
+    Plane,
+    Circle,
+    Cube,
+    Sphere,
+}
+
+impl DrawTool {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Voxel => "Voxel",
+            Self::Line => "Line",
+            Self::Plane => "Plane",
+            Self::Circle => "Circle",
+            Self::Cube => "Cube",
+            Self::Sphere => "Sphere",
+        }
+    }
+
+    fn is_shape(self) -> bool {
+        !matches!(self, Self::Voxel)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ShapeAnchor {
+    local: IVec3,
+    world: IVec3,
+    transform_id: Option<voxel_core::NodeId>,
+    model_id: Option<usize>,
+}
+
+struct PaintTarget {
+    hit: raycast::Hit,
+    place_w: IVec3,
+    hit_w: IVec3,
+}
+
+impl PaintTarget {
+    fn paint_local(&self, erase: bool, overpaint: bool) -> IVec3 {
+        if erase || (overpaint && self.hit.from_solid) {
+            IVec3::new(self.hit.x, self.hit.y, self.hit.z)
+        } else {
+            IVec3::new(self.hit.place_x, self.hit.place_y, self.hit.place_z)
+        }
+    }
+
+    fn paint_world(&self, erase: bool, overpaint: bool) -> IVec3 {
+        if erase || (overpaint && self.hit.from_solid) {
+            self.hit_w
+        } else if self.hit.from_solid {
+            self.place_w
+        } else {
+            self.hit_w
+        }
+    }
+}
+
 struct EditorApp {
     project: Project,
     path: PathBuf,
@@ -116,6 +183,14 @@ struct EditorApp {
     disk_mtime: Option<SystemTime>,
     disk_stable_since: Option<Instant>,
     disk_conflict: bool,
+    paint_mode: PaintMode,
+    draw_tool: DrawTool,
+    shape_anchor: Option<ShapeAnchor>,
+    paint_stroke_checkpointed: bool,
+    shape_drag_from_anchor: bool,
+    shape_just_committed: bool,
+    anchor_set_on_press: bool,
+    edit_checkpoint_open: bool,
 }
 
 impl EditorApp {
@@ -178,6 +253,14 @@ impl EditorApp {
             disk_mtime: None,
             disk_stable_since: None,
             disk_conflict: false,
+            paint_mode: PaintMode::Place,
+            draw_tool: DrawTool::Voxel,
+            shape_anchor: None,
+            paint_stroke_checkpointed: false,
+            shape_drag_from_anchor: false,
+            shape_just_committed: false,
+            anchor_set_on_press: false,
+            edit_checkpoint_open: false,
         }
     }
 
@@ -209,6 +292,7 @@ impl EditorApp {
                     self.viewport3d.mark_dirty();
                     self.dirty = false;
                     self.hover = None;
+                    self.shape_anchor = None;
                     self.file_mtime = file_mtime(&self.path);
                     self.disk_mtime = self.file_mtime;
                     self.disk_stable_since = None;
@@ -235,6 +319,7 @@ impl EditorApp {
                 self.viewport3d.mark_dirty();
                 self.dirty = false;
                 self.hover = None;
+                self.shape_anchor = None;
                 self.file_mtime = file_mtime(&self.path);
                 self.disk_mtime = self.file_mtime;
                 self.disk_stable_since = None;
@@ -350,6 +435,342 @@ impl EditorApp {
         }
     }
 
+    fn overpaint(&self) -> bool {
+        self.paint_mode == PaintMode::Overpaint
+    }
+
+    fn checkpoint_edit_start(&mut self) {
+        if !self.edit_checkpoint_open {
+            self.project.checkpoint();
+            self.edit_checkpoint_open = true;
+        }
+    }
+
+    fn cancel_shape(&mut self) {
+        if self.shape_anchor.take().is_some() {
+            self.status = "shape cancelled".into();
+        }
+        self.shape_drag_from_anchor = false;
+        self.anchor_set_on_press = false;
+    }
+
+    fn set_draw_tool(&mut self, tool: DrawTool) {
+        if self.draw_tool == tool {
+            if tool == DrawTool::Voxel {
+                self.cancel_shape();
+            }
+            return;
+        }
+        self.cancel_shape();
+        self.draw_tool = tool;
+        self.status = if tool == DrawTool::Voxel {
+            "voxel tool".into()
+        } else {
+            format!(
+                "{}: click two cells or click-drag  ·  Esc cancel",
+                tool.label()
+            )
+        };
+    }
+
+    fn do_undo(&mut self) {
+        if self.project.undo() {
+            self.dirty = true;
+            self.viewport3d.mark_dirty();
+            self.sync_translation_fields();
+            self.hover = None;
+            self.shape_anchor = None;
+            self.status = "undo".into();
+        } else {
+            self.status = "nothing to undo".into();
+        }
+    }
+
+    fn do_redo(&mut self) {
+        if self.project.redo() {
+            self.dirty = true;
+            self.viewport3d.mark_dirty();
+            self.sync_translation_fields();
+            self.hover = None;
+            self.shape_anchor = None;
+            self.status = "redo".into();
+        } else {
+            self.status = "nothing to redo".into();
+        }
+    }
+
+    fn delete_selected_object(&mut self) {
+        let (root, selected) = self
+            .project
+            .with_inner(|p| (p.scene.root, p.selected_node));
+        let Some(id) = selected else {
+            self.status = "no object selected".into();
+            return;
+        };
+        if id == root {
+            self.status = "cannot delete scene root".into();
+            return;
+        }
+        if self.project.delete_object(id) {
+            self.sync_translation_fields();
+            self.dirty = true;
+            self.viewport3d.mark_dirty();
+            self.status = format!("deleted object #{id}");
+        } else {
+            self.status = "could not delete object".into();
+        }
+    }
+
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let wants_text = ctx.wants_keyboard_input();
+        let (undo, redo, delete, escape) = ctx.input(|i| {
+            let z = i.key_pressed(egui::Key::Z);
+            let y = i.key_pressed(egui::Key::Y);
+            let shift = i.modifiers.shift;
+            let accel = i.modifiers.command || i.modifiers.ctrl;
+            let undo = z && accel && !shift;
+            let redo = (z && accel && shift) || (y && i.modifiers.ctrl && !shift);
+            let delete = i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace);
+            let escape = i.key_pressed(egui::Key::Escape);
+            (undo, redo, delete, escape)
+        });
+        if undo {
+            self.do_undo();
+        } else if redo {
+            self.do_redo();
+        }
+        if escape {
+            self.cancel_shape();
+        }
+        if delete && !wants_text {
+            let world = self.project.with_inner(|p| p.edit_mode == EditMode::World);
+            if world {
+                self.delete_selected_object();
+            }
+        }
+    }
+
+    fn camera_dominant_axis(&self) -> char {
+        let f = self.camera.target - self.camera.eye();
+        let ax = f.x.abs();
+        let ay = f.y.abs();
+        let az = f.z.abs();
+        if ax >= ay && ax >= az {
+            'x'
+        } else if ay >= az {
+            'y'
+        } else {
+            'z'
+        }
+    }
+
+    fn pick_target(&self, rect: egui::Rect, pos: egui::Pos2) -> Option<PaintTarget> {
+        let (hit, place_w, hit_w) = self.pick(rect, pos)?;
+        Some(PaintTarget {
+            hit,
+            place_w,
+            hit_w,
+        })
+    }
+
+    fn commit_shape(&mut self, a: ShapeAnchor, t: &PaintTarget) {
+        let over = self.overpaint();
+        let b_local = t.paint_local(false, over);
+        if let Some(mid) = a.model_id {
+            self.project.set_active_model(mid);
+        }
+        if let Some(tid) = a.transform_id {
+            self.project.select_node(Some(tid));
+            self.sync_translation_fields();
+        }
+        let color = self.project.with_inner(|p| p.active_color);
+        self.project.checkpoint();
+        let result = match self.draw_tool {
+            DrawTool::Voxel => return,
+            DrawTool::Line => self.project.fill_line(a.local, b_local, color),
+            DrawTool::Cube => {
+                let min = ivec_min(a.local, b_local);
+                let max = ivec_max(a.local, b_local);
+                self.project.fill_box(min, max, color)
+            }
+            DrawTool::Sphere => {
+                let r = euclidean_radius(a.local, b_local);
+                self.project.fill_sphere(a.local, r, color)
+            }
+            DrawTool::Circle => {
+                let axis = self.camera_dominant_axis();
+                let r = in_plane_radius(a.local, b_local, axis);
+                self.project.fill_circle(a.local, r, axis, color)
+            }
+            DrawTool::Plane => {
+                let axis = flattest_axis(a.local, b_local);
+                self.project.fill_plane_rect(a.local, b_local, axis, color)
+            }
+        };
+        match result {
+            Ok(n) => {
+                self.dirty = true;
+                self.viewport3d.mark_dirty();
+                self.status = format!(
+                    "{}  ·  {n} voxels  ·  color {color}",
+                    self.draw_tool.label().to_ascii_lowercase()
+                );
+            }
+            Err(e) => self.status = format!("shape failed: {e}"),
+        }
+    }
+
+    fn shape_anchor_from_target(&self, t: &PaintTarget) -> ShapeAnchor {
+        let over = self.overpaint();
+        ShapeAnchor {
+            local: t.paint_local(false, over),
+            world: t.paint_world(false, over),
+            transform_id: t.hit.transform_id,
+            model_id: t.hit.model_id,
+        }
+    }
+
+    fn handle_shape_pointer(&mut self, response: &egui::Response, rect: egui::Rect) {
+        let pos = response
+            .interact_pointer_pos()
+            .or(response.hover_pos());
+
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            if let Some(pos) = pos {
+                if let Some(t) = self.pick_target(rect, pos) {
+                    if self.shape_anchor.is_none() {
+                        let a = self.shape_anchor_from_target(&t);
+                        self.status = format!(
+                            "{} anchor  {}, {}, {}",
+                            self.draw_tool.label(),
+                            a.local.x,
+                            a.local.y,
+                            a.local.z
+                        );
+                        self.shape_anchor = Some(a);
+                        self.anchor_set_on_press = true;
+                    }
+                    self.shape_drag_from_anchor = true;
+                }
+            }
+        }
+
+        if response.drag_stopped() {
+            if self.shape_drag_from_anchor {
+                if let (Some(anchor), Some(pos)) = (self.shape_anchor, pos) {
+                    if let Some(t) = self.pick_target(rect, pos) {
+                        let over = self.overpaint();
+                        let b = t.paint_local(false, over);
+                        if b != anchor.local {
+                            self.commit_shape(anchor, &t);
+                            self.shape_anchor = None;
+                            self.shape_just_committed = true;
+                            self.anchor_set_on_press = false;
+                        }
+                    }
+                }
+            }
+            self.shape_drag_from_anchor = false;
+        }
+
+        if response.clicked_by(egui::PointerButton::Primary) {
+            if self.shape_just_committed {
+                self.shape_just_committed = false;
+            } else if self.anchor_set_on_press {
+                self.anchor_set_on_press = false;
+            } else if let Some(pos) = pos {
+                if let Some(t) = self.pick_target(rect, pos) {
+                    if let Some(anchor) = self.shape_anchor {
+                        self.commit_shape(anchor, &t);
+                        self.shape_anchor = None;
+                    } else {
+                        let a = self.shape_anchor_from_target(&t);
+                        self.status = format!(
+                            "{} anchor  {}, {}, {}  ·  click again to commit",
+                            self.draw_tool.label(),
+                            a.local.x,
+                            a.local.y,
+                            a.local.z
+                        );
+                        self.shape_anchor = Some(a);
+                    }
+                }
+            }
+        } else if !response.dragged_by(egui::PointerButton::Primary) {
+            self.shape_just_committed = false;
+        }
+    }
+
+    fn ui_paint_mode(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (mode, label) in [
+                (PaintMode::Place, "Place"),
+                (PaintMode::Overpaint, "Overpaint"),
+            ] {
+                let selected = self.paint_mode == mode;
+                if ui
+                    .add(
+                        egui::Button::new(label)
+                            .fill(if selected {
+                                theme::ACCENT_DIM
+                            } else {
+                                egui::Color32::from_rgb(40, 44, 52)
+                            })
+                            .selected(selected),
+                    )
+                    .clicked()
+                {
+                    self.paint_mode = mode;
+                    self.status = if mode == PaintMode::Overpaint {
+                        "overpaint: recolor hit voxel (Shift erases)".into()
+                    } else {
+                        "place: paint adjacent cell".into()
+                    };
+                }
+            }
+        });
+    }
+
+    fn ui_draw_tools(&mut self, ui: &mut egui::Ui) {
+        section_label(ui, "DRAW");
+        let tools = [
+            DrawTool::Voxel,
+            DrawTool::Line,
+            DrawTool::Plane,
+            DrawTool::Circle,
+            DrawTool::Cube,
+            DrawTool::Sphere,
+        ];
+        ui.scope(|ui| {
+            let gap = 4.0;
+            ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
+            let btn_w = ((ui.available_width() - gap * 2.0) / 3.0).max(56.0);
+            for row in tools.chunks(3) {
+                ui.horizontal(|ui| {
+                    for &tool in row {
+                        let selected = self.draw_tool == tool;
+                        if ui
+                            .add_sized(
+                                [btn_w, 28.0],
+                                egui::Button::new(tool.label())
+                                    .fill(if selected {
+                                        theme::ACCENT_DIM
+                                    } else {
+                                        egui::Color32::from_rgb(40, 44, 52)
+                                    })
+                                    .selected(selected),
+                            )
+                            .clicked()
+                        {
+                            self.set_draw_tool(tool);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
     fn pick(
         &self,
         rect: egui::Rect,
@@ -412,22 +833,27 @@ impl EditorApp {
             return;
         };
         if let Some((hit, place_w, hit_w)) = self.pick(rect, pos) {
-            // Ghost tracks where the ray reaches:
-            // - solid: the face voxel (farther than the empty place neighbor)
-            // - empty volume: far cell inside the bounds
-            // Erase highlights the solid; paint preview uses place (adjacent) when from solid.
-            let cell = if erase {
-                hit_w
-            } else if hit.from_solid {
-                place_w
-            } else {
-                hit_w // far empty cell
+            let target = PaintTarget {
+                hit,
+                place_w,
+                hit_w,
             };
+            let cell = target.paint_world(erase, self.overpaint());
             self.hover = Some(HoverCell {
                 cell,
                 erase,
                 from_solid: hit.from_solid,
             });
+            if let (Some(a), Some(h)) = (self.shape_anchor, self.hover) {
+                if !erase && self.draw_tool.is_shape() {
+                    self.status = shape_preview_status(
+                        self.draw_tool,
+                        a.world,
+                        h.cell,
+                        self.camera_dominant_axis(),
+                    );
+                }
+            }
         } else {
             self.hover = None;
         }
@@ -438,7 +864,12 @@ impl EditorApp {
             return;
         };
 
-        let cell = if erase { hit_w } else { place_w };
+        let over = self.overpaint();
+        let cell = if erase || (over && hit.from_solid) {
+            hit_w
+        } else {
+            place_w
+        };
         // Snap: only apply once per cell while dragging
         if self.last_paint_cell == Some(cell) {
             return;
@@ -464,6 +895,15 @@ impl EditorApp {
                 self.viewport3d.mark_dirty();
                 self.status = format!("erase  {}, {}, {}", hit.x, hit.y, hit.z);
             }
+        } else if over && hit.from_solid {
+            if self.project.set_voxel(hit.x, hit.y, hit.z, active).is_ok() {
+                self.dirty = true;
+                self.viewport3d.mark_dirty();
+                self.status = format!(
+                    "overpaint  {}, {}, {}  ·  color {active}",
+                    hit.x, hit.y, hit.z
+                );
+            }
         } else if self
             .project
             .set_voxel(hit.place_x, hit.place_y, hit.place_z, active)
@@ -481,7 +921,7 @@ impl EditorApp {
     fn build_draw_mesh(&self) -> mesh::MeshData {
         let snap = self.project.snapshot();
         match snap.edit_mode {
-            EditMode::Model => mesh::build_mesh(snap.model(), &snap.palette),
+            EditMode::Model => mesh::build_mesh(snap.model(), &snap.palette, &snap.scene.materials),
             EditMode::World => {
                 let instances = snap.scene.collect_instances();
                 let refs: Vec<_> = instances
@@ -493,7 +933,7 @@ impl EditorApp {
                             .map(|m| (m, i.translation, i.rotation))
                     })
                     .collect();
-                mesh::build_world_mesh(&refs, &snap.palette)
+                mesh::build_world_mesh(&refs, &snap.palette, &snap.scene.materials)
             }
         }
     }
@@ -564,9 +1004,21 @@ impl EditorApp {
                     c.b as f32 / 255.0,
                 ]
             };
+            let mut points = mesh::build_wire_cube(cell.x, cell.y, cell.z, 0.02);
+            if let Some(a) = self.shape_anchor {
+                if self.draw_tool.is_shape() && !h.erase {
+                    points.extend(mesh::build_wire_cube(a.world.x, a.world.y, a.world.z, 0.02));
+                    points.extend(shape_preview_lines(
+                        self.draw_tool,
+                        a.world,
+                        cell,
+                        self.camera_dominant_axis(),
+                    ));
+                }
+            }
             (
                 Some(LineLayer {
-                    points: mesh::build_wire_cube(cell.x, cell.y, cell.z, 0.02),
+                    points,
                     color: wire_color,
                 }),
                 Some(mesh::build_ghost_cube_mesh(cell.x, cell.y, cell.z, fill, 0.04)),
@@ -583,6 +1035,166 @@ impl EditorApp {
             ghost_alpha,
         }
     }
+
+    fn ui_material_panel(&mut self, ui: &mut egui::Ui, active: ColorIndex) {
+        let mut mat = self
+            .project
+            .with_inner(|p| p.scene.materials.get(active).clone());
+        let prev_kind = mat.kind;
+        let albedo = self.project.with_inner(|p| p.palette.get(active));
+
+        ui.label(
+            egui::RichText::new("MATERIAL")
+                .size(13.0)
+                .color(theme::ACCENT)
+                .strong(),
+        );
+        ui.label(
+            egui::RichText::new(format!("#{active}  ·  {}", mat.kind.label()))
+                .size(12.0)
+                .color(theme::MUTED),
+        );
+        ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            let swatch = egui::Color32::from_rgba_unmultiplied(albedo.r, albedo.g, albedo.b, 255);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(36.0, 36.0), egui::Sense::hover());
+            ui.painter().rect_filled(rect, 5.0, swatch);
+            ui.painter().rect_stroke(
+                rect,
+                5.0,
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(70, 76, 86)),
+                egui::StrokeKind::Outside,
+            );
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new("Type for this palette color")
+                        .size(11.0)
+                        .color(theme::MUTED),
+                );
+                let mut color32 =
+                    egui::Color32::from_rgba_unmultiplied(albedo.r, albedo.g, albedo.b, albedo.a);
+                if ui.color_edit_button_srgba(&mut color32).changed() {
+                    self.checkpoint_edit_start();
+                    let rgba = ColorRgba::new(color32.r(), color32.g(), color32.b(), color32.a());
+                    if self.project.set_palette_color(active, rgba).is_ok() {
+                        self.dirty = true;
+                        self.viewport3d.mark_dirty();
+                    }
+                }
+            });
+        });
+        ui.add_space(6.0);
+
+        ui.scope(|ui| {
+            let gap = 6.0;
+            let btn_w = ((ui.available_width() - gap) / 2.0).max(80.0);
+            ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
+            for row in [
+                [MaterialKind::Diffuse, MaterialKind::Metal],
+                [MaterialKind::Glass, MaterialKind::Emit],
+            ] {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for kind in row {
+                        let selected = mat.kind == kind;
+                        let fill = if selected {
+                            theme::ACCENT_DIM
+                        } else {
+                            egui::Color32::from_rgb(40, 44, 52)
+                        };
+                        if ui
+                            .add_sized(
+                                [btn_w, 34.0],
+                                egui::Button::new(kind.label()).fill(fill).selected(selected),
+                            )
+                            .clicked()
+                        {
+                            mat.kind = kind;
+                        }
+                    }
+                });
+            }
+        });
+
+        let weight_label = match mat.kind {
+            MaterialKind::Metal | MaterialKind::Blend => "Metal",
+            MaterialKind::Glass | MaterialKind::Media => "Alpha",
+            MaterialKind::Emit => "Emit",
+            MaterialKind::Diffuse => "Weight",
+        };
+        ui.add(egui::Slider::new(&mut mat.weight, 0.0..=1.0).text(weight_label));
+        if matches!(
+            mat.kind,
+            MaterialKind::Metal | MaterialKind::Glass | MaterialKind::Blend | MaterialKind::Media
+        ) {
+            ui.add(egui::Slider::new(&mut mat.rough, 0.0..=1.0).text("Rough"));
+        }
+        if matches!(mat.kind, MaterialKind::Metal | MaterialKind::Blend) {
+            ui.add(egui::Slider::new(&mut mat.spec, 0.0..=1.0).text("Spec"));
+        }
+        if matches!(mat.kind, MaterialKind::Glass | MaterialKind::Media) {
+            ui.add(egui::Slider::new(&mut mat.ior, 0.0..=1.0).text("IOR"));
+            ui.add(egui::Slider::new(&mut mat.att, 0.0..=1.0).text("Att"));
+        }
+        if mat.kind == MaterialKind::Emit {
+            ui.add(egui::Slider::new(&mut mat.flux, 0.0..=4.0).text("Flux"));
+        }
+
+        let mat_now = self
+            .project
+            .with_inner(|p| p.scene.materials.get(active).clone());
+        if mat != mat_now {
+            self.checkpoint_edit_start();
+            let _ = self.project.set_material(active, mat.clone());
+            self.dirty = true;
+            if mat.kind != prev_kind
+                || mat.kind == MaterialKind::Emit
+                || mat_now.kind == MaterialKind::Emit
+            {
+                self.viewport3d.mark_dirty();
+            }
+        }
+    }
+
+    fn ui_palette_grid(&mut self, ui: &mut egui::Ui, active: ColorIndex) {
+        let colors: Vec<(u8, [f32; 4])> = self.project.with_inner(|p| {
+            (1u8..=255)
+                .map(|i| (i, p.palette.get(i).to_egui_rgba()))
+                .collect()
+        });
+        egui::ScrollArea::vertical()
+            .id_salt("palette_grid")
+            .max_height(108.0)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
+                    for (i, rgba) in colors {
+                        let color = egui::Color32::from_rgba_unmultiplied(
+                            (rgba[0] * 255.0) as u8,
+                            (rgba[1] * 255.0) as u8,
+                            (rgba[2] * 255.0) as u8,
+                            255,
+                        );
+                        let (rect, response) =
+                            ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+                        ui.painter().rect_filled(rect, 3.0, color);
+                        if i == active {
+                            ui.painter().rect_stroke(
+                                rect,
+                                3.0,
+                                egui::Stroke::new(1.5_f32, theme::ACCENT),
+                                egui::StrokeKind::Outside,
+                            );
+                        }
+                        if response.clicked() {
+                            self.project.set_active_color(i);
+                        }
+                        response.on_hover_text(format!("Palette {i}"));
+                    }
+                });
+            });
+    }
 }
 
 impl eframe::App for EditorApp {
@@ -592,6 +1204,10 @@ impl eframe::App for EditorApp {
             self.theme_ready = true;
         }
         self.poll_external_reload(ctx);
+        self.handle_shortcuts(ctx);
+        if !ctx.input(|i| i.pointer.any_down()) {
+            self.edit_checkpoint_open = false;
+        }
 
         // ── Top bar ──────────────────────────────────────────────
         egui::TopBottomPanel::top("top")
@@ -639,11 +1255,15 @@ impl eframe::App for EditorApp {
                         self.project.set_edit_mode(mode);
                         self.viewport3d.mark_dirty();
                         self.hover = None;
+                        self.cancel_shape();
                         self.status = match mode {
                             EditMode::Model => "Model editor".into(),
                             EditMode::World => "World editor".into(),
                         };
                     }
+
+                    ui.add_space(8.0);
+                    self.ui_paint_mode(ui);
 
                     ui.add_space(12.0);
                     ui.checkbox(&mut self.show_grid, "Grid");
@@ -697,7 +1317,7 @@ impl eframe::App for EditorApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(
-                                "LMB paint  ·  Shift erase  ·  RMB orbit  ·  MMB pan  ·  scroll zoom",
+                                "LMB paint  ·  Shift erase  ·  ⌘Z undo  ·  RMB orbit  ·  MMB pan  ·  scroll zoom",
                             )
                             .color(theme::MUTED)
                             .size(11.5),
@@ -708,7 +1328,7 @@ impl eframe::App for EditorApp {
 
         // ── Left tool panel ──────────────────────────────────────
         egui::SidePanel::left("tools")
-            .default_width(248.0)
+            .default_width(268.0)
             .resizable(true)
             .frame(
                 egui::Frame::new()
@@ -718,8 +1338,16 @@ impl eframe::App for EditorApp {
             )
             .show(ctx, |ui| {
                 let mode = self.project.with_inner(|p| p.edit_mode);
-                section_label(ui, "PALETTE");
                 let active = self.project.with_inner(|p| p.active_color);
+
+                // Material first so it is never buried under the 255-color grid.
+                self.ui_material_panel(ui, active);
+
+                ui.add_space(10.0);
+                self.ui_draw_tools(ui);
+
+                ui.add_space(12.0);
+                section_label(ui, "PALETTE");
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(format!("#{active}"))
@@ -735,45 +1363,14 @@ impl eframe::App for EditorApp {
                         .size(12.0),
                     );
                 });
-                ui.add_space(6.0);
-
-                let colors: Vec<(u8, [f32; 4])> = self.project.with_inner(|p| {
-                    (1u8..=255)
-                        .map(|i| (i, p.palette.get(i).to_egui_rgba()))
-                        .collect()
-                });
-                egui::ScrollArea::vertical()
-                    .max_height(220.0)
-                    .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
-                            for (i, rgba) in colors {
-                                let color = egui::Color32::from_rgba_unmultiplied(
-                                    (rgba[0] * 255.0) as u8,
-                                    (rgba[1] * 255.0) as u8,
-                                    (rgba[2] * 255.0) as u8,
-                                    255,
-                                );
-                                let (rect, response) = ui
-                                    .allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::click());
-                                ui.painter().rect_filled(rect, 3.0, color);
-                                if i == active {
-                                    ui.painter().rect_stroke(
-                                        rect,
-                                        3.0,
-                                        egui::Stroke::new(1.5_f32, theme::ACCENT),
-                                        egui::StrokeKind::Outside,
-                                    );
-                                }
-                                if response.clicked() {
-                                    self.project.set_active_color(i);
-                                }
-                                response.on_hover_text(format!("Palette {i}"));
-                            }
-                        });
-                    });
+                ui.add_space(4.0);
+                self.ui_palette_grid(ui, active);
 
                 ui.add_space(10.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("tools_rest")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                 if ui
                     .add(
                         egui::Button::new("Clear model")
@@ -782,37 +1379,149 @@ impl eframe::App for EditorApp {
                     )
                     .clicked()
                 {
+                    self.project.checkpoint();
                     self.project.clear();
                     self.dirty = true;
                     self.viewport3d.mark_dirty();
+                    self.status = "model cleared".into();
                 }
 
                 if mode == EditMode::World {
                     ui.add_space(14.0);
+                    section_label(ui, "LAYERS");
+                    let mut layer_dirty = false;
+                    let mut viewport_dirty = false;
+                    self.project.with_inner_mut(|p| {
+                        for layer in &mut p.scene.layers.layers {
+                            ui.horizontal(|ui| {
+                                let mut visible = !layer.hidden;
+                                if ui
+                                    .checkbox(&mut visible, "")
+                                    .on_hover_text("Visible")
+                                    .changed()
+                                {
+                                    layer.hidden = !visible;
+                                    layer_dirty = true;
+                                    viewport_dirty = true;
+                                }
+                                let swatch = egui::Color32::from_rgb(
+                                    layer.color[0],
+                                    layer.color[1],
+                                    layer.color[2],
+                                );
+                                let (rect, _) =
+                                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                                ui.painter().rect_filled(rect, 2.0, swatch);
+                                ui.label(
+                                    egui::RichText::new(format!("{}", layer.id))
+                                        .size(11.0)
+                                        .color(theme::MUTED),
+                                );
+                                if ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut layer.name)
+                                            .desired_width(110.0),
+                                    )
+                                    .changed()
+                                {
+                                    layer_dirty = true;
+                                }
+                            });
+                        }
+                    });
+                    if layer_dirty {
+                        self.dirty = true;
+                    }
+                    if viewport_dirty {
+                        self.viewport3d.mark_dirty();
+                    }
+
+                    let selected = self.project.with_inner(|p| p.selected_node);
+                    let current_layer = selected.and_then(|id| {
+                        self.project.with_inner(|p| p.scene.object_layer(id))
+                    });
+                    if let (Some(nid), Some(cur)) = (selected, current_layer) {
+                        let layer_choices: Vec<(i32, String)> = self.project.with_inner(|p| {
+                            p.scene
+                                .layers
+                                .layers
+                                .iter()
+                                .map(|l| (l.id, l.display_name()))
+                                .collect()
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Object layer")
+                                    .size(12.0)
+                                    .color(theme::MUTED),
+                            );
+                            let mut chosen = cur;
+                            egui::ComboBox::from_id_salt("obj_layer")
+                                .selected_text(
+                                    layer_choices
+                                        .iter()
+                                        .find(|(id, _)| *id == chosen)
+                                        .map(|(_, n)| n.as_str())
+                                        .unwrap_or("—"),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (id, name) in &layer_choices {
+                                        ui.selectable_value(&mut chosen, *id, name);
+                                    }
+                                });
+                            if chosen != cur {
+                                self.project.set_object_layer(nid, chosen);
+                                self.dirty = true;
+                                self.viewport3d.mark_dirty();
+                            }
+                        });
+                    }
+
+                    ui.add_space(8.0);
                     section_label(ui, "OBJECTS");
                     let objects = self.project.with_inner(|p| p.scene.list_objects());
                     let selected = self.project.with_inner(|p| p.selected_node);
                     egui::ScrollArea::vertical()
+                        .id_salt("objects")
                         .max_height(160.0)
                         .show(ui, |ui| {
-                            for (id, name, t, hidden, mid) in &objects {
-                                let selected_here = selected == Some(*id);
-                                let label = format!("{name}  ·  m{mid}");
+                            for o in &objects {
+                                let selected_here = selected == Some(o.id);
+                                let label = format!("{}  ·  m{}  L{}", o.name, o.model_id, o.layer_id);
                                 let resp = ui.selectable_label(selected_here, &label);
                                 if resp.clicked() {
-                                    self.project.select_node(Some(*id));
+                                    self.project.select_node(Some(o.id));
                                     self.sync_translation_fields();
-                                    self.status = format!("selected {name}");
+                                    self.status = format!("selected {}", o.name);
                                 }
                                 resp.on_hover_text(format!(
-                                    "id {id}  t({},{},{}){}",
-                                    t.x,
-                                    t.y,
-                                    t.z,
-                                    if *hidden { " hidden" } else { "" }
+                                    "id {}  t({},{},{})  layer {}{}",
+                                    o.id,
+                                    o.translation.x,
+                                    o.translation.y,
+                                    o.translation.z,
+                                    o.layer_id,
+                                    if o.hidden { "  hidden" } else { "" }
                                 ));
                             }
                         });
+
+                    let root = self.project.with_inner(|p| p.scene.root);
+                    let can_delete = selected.map(|id| id != root).unwrap_or(false);
+                    ui.add_space(6.0);
+                    ui.add_enabled_ui(can_delete, |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new("Delete object")
+                                    .fill(egui::Color32::from_rgb(60, 36, 36))
+                                    .min_size(egui::vec2(ui.available_width(), 28.0)),
+                            )
+                            .on_hover_text("Delete / Backspace")
+                            .clicked()
+                        {
+                            self.delete_selected_object();
+                        }
+                    });
 
                     ui.add_space(8.0);
                     section_label(ui, "TRANSFORM");
@@ -830,6 +1539,7 @@ impl eframe::App for EditorApp {
                         .clicked()
                     {
                         if let Some(id) = self.project.with_inner(|p| p.selected_node) {
+                            self.project.checkpoint();
                             self.project
                                 .set_object_translation(id, IVec3::new(self.tx, self.ty, self.tz));
                             self.dirty = true;
@@ -846,6 +1556,7 @@ impl eframe::App for EditorApp {
                     ui.horizontal(|ui| {
                         if ui.button("Add 32³").clicked() {
                             let name = self.new_obj_name.clone();
+                            self.project.checkpoint();
                             if let Ok(id) = self.project.add_object(
                                 &name,
                                 32,
@@ -859,6 +1570,7 @@ impl eframe::App for EditorApp {
                         }
                         if ui.button("Duplicate").clicked() {
                             let name = format!("{}_copy", self.new_obj_name);
+                            self.project.checkpoint();
                             if let Ok(id) = self.project.duplicate_active_object(
                                 &name,
                                 IVec3::new(self.tx + 40, self.ty, self.tz),
@@ -871,6 +1583,7 @@ impl eframe::App for EditorApp {
                         }
                     });
                 }
+                    });
             });
 
         if self.show_slice {
@@ -925,6 +1638,12 @@ impl eframe::App for EditorApp {
                     }
                     if let Some(pos) = response.interact_pointer_pos() {
                         if response.dragged() || response.clicked() {
+                            if (response.drag_started() || response.clicked())
+                                && !self.paint_stroke_checkpointed
+                            {
+                                self.project.checkpoint();
+                                self.paint_stroke_checkpointed = true;
+                            }
                             let local = pos - rect.min;
                             let x = (local.x / cell).floor() as i32;
                             let y = (sy as i32 - 1) - (local.y / cell).floor() as i32;
@@ -940,6 +1659,9 @@ impl eframe::App for EditorApp {
                                 }
                             }
                         }
+                    }
+                    if !response.dragged() {
+                        self.paint_stroke_checkpointed = false;
                     }
                 });
         }
@@ -983,27 +1705,40 @@ impl eframe::App for EditorApp {
                     self.orbiting = true;
                     let delta = response.drag_delta();
                     self.camera.pan(Vec2::new(delta.x, delta.y), rect.height());
-                } else if response.dragged_by(egui::PointerButton::Primary) && !modifiers.alt {
-                    if let Some(pos) = response.interact_pointer_pos() {
-                        self.paint_at_pointer(rect, pos, erase);
+                } else if !modifiers.alt && !modifiers.command {
+                    let voxel_like = erase || self.draw_tool == DrawTool::Voxel;
+                    if voxel_like {
+                        if response.drag_started_by(egui::PointerButton::Primary) {
+                            self.project.checkpoint();
+                            self.paint_stroke_checkpointed = true;
+                            self.last_paint_cell = None;
+                        }
+                        if response.dragged_by(egui::PointerButton::Primary) {
+                            if let Some(pos) = response.interact_pointer_pos() {
+                                self.paint_at_pointer(rect, pos, erase);
+                            }
+                        }
+                        if response.clicked_by(egui::PointerButton::Primary) && !self.orbiting {
+                            if !self.paint_stroke_checkpointed {
+                                self.project.checkpoint();
+                            }
+                            self.last_paint_cell = None;
+                            if let Some(pos) = response.interact_pointer_pos() {
+                                self.paint_at_pointer(rect, pos, erase);
+                            }
+                        }
+                    } else if !self.orbiting {
+                        self.handle_shape_pointer(&response, rect);
                     }
                 }
 
-                if response.clicked_by(egui::PointerButton::Primary)
-                    && !modifiers.alt
-                    && !self.orbiting
-                {
-                    self.last_paint_cell = None;
-                    if let Some(pos) = response.interact_pointer_pos() {
-                        self.paint_at_pointer(rect, pos, erase);
-                    }
-                }
                 if response.drag_started() {
                     self.last_paint_cell = None;
                 }
                 if response.drag_stopped() {
                     self.orbiting = false;
                     self.last_paint_cell = None;
+                    self.paint_stroke_checkpointed = false;
                 }
 
                 // Toggle grid → rebuild guides
@@ -1041,6 +1776,10 @@ impl eframe::App for EditorApp {
                 if let Some(h) = self.hover {
                     let tag = if h.erase {
                         "ERASE"
+                    } else if self.draw_tool.is_shape() {
+                        self.draw_tool.label()
+                    } else if self.overpaint() && h.from_solid {
+                        "OVERPAINT"
                     } else if h.from_solid {
                         "PLACE"
                     } else {
@@ -1123,4 +1862,157 @@ fn mode_toggle(ui: &mut egui::Ui, mode: &mut EditMode) {
             *mode = EditMode::World;
         }
     });
+}
+
+fn ivec_min(a: IVec3, b: IVec3) -> IVec3 {
+    IVec3::new(a.x.min(b.x), a.y.min(b.y), a.z.min(b.z))
+}
+
+fn ivec_max(a: IVec3, b: IVec3) -> IVec3 {
+    IVec3::new(a.x.max(b.x), a.y.max(b.y), a.z.max(b.z))
+}
+
+fn euclidean_radius(a: IVec3, b: IVec3) -> u32 {
+    let dx = (a.x - b.x) as i64;
+    let dy = (a.y - b.y) as i64;
+    let dz = (a.z - b.z) as i64;
+    ((dx * dx + dy * dy + dz * dz) as f64).sqrt().round() as u32
+}
+
+fn in_plane_radius(a: IVec3, b: IVec3, axis: char) -> u32 {
+    match axis {
+        'x' | 'X' => {
+            let dy = (a.y - b.y) as i64;
+            let dz = (a.z - b.z) as i64;
+            ((dy * dy + dz * dz) as f64).sqrt().round() as u32
+        }
+        'y' | 'Y' => {
+            let dx = (a.x - b.x) as i64;
+            let dz = (a.z - b.z) as i64;
+            ((dx * dx + dz * dz) as f64).sqrt().round() as u32
+        }
+        _ => {
+            let dx = (a.x - b.x) as i64;
+            let dy = (a.y - b.y) as i64;
+            ((dx * dx + dy * dy) as f64).sqrt().round() as u32
+        }
+    }
+}
+
+fn flattest_axis(a: IVec3, b: IVec3) -> char {
+    let dx = (a.x - b.x).abs();
+    let dy = (a.y - b.y).abs();
+    let dz = (a.z - b.z).abs();
+    if dx <= dy && dx <= dz {
+        'x'
+    } else if dy <= dz {
+        'y'
+    } else {
+        'z'
+    }
+}
+
+fn aabb_wire(min: IVec3, max: IVec3) -> Vec<[f32; 3]> {
+    mesh::build_bounds_lines_aabb(
+        [min.x as f32, min.y as f32, min.z as f32],
+        [
+            (max.x + 1) as f32,
+            (max.y + 1) as f32,
+            (max.z + 1) as f32,
+        ],
+    )
+}
+
+fn shape_preview_lines(tool: DrawTool, a: IVec3, b: IVec3, cam_axis: char) -> Vec<[f32; 3]> {
+    match tool {
+        DrawTool::Voxel => Vec::new(),
+        DrawTool::Line => vec![
+            [a.x as f32 + 0.5, a.y as f32 + 0.5, a.z as f32 + 0.5],
+            [b.x as f32 + 0.5, b.y as f32 + 0.5, b.z as f32 + 0.5],
+        ],
+        DrawTool::Cube => aabb_wire(ivec_min(a, b), ivec_max(a, b)),
+        DrawTool::Sphere => {
+            let r = euclidean_radius(a, b) as i32;
+            aabb_wire(
+                IVec3::new(a.x - r, a.y - r, a.z - r),
+                IVec3::new(a.x + r, a.y + r, a.z + r),
+            )
+        }
+        DrawTool::Circle => {
+            let r = in_plane_radius(a, b, cam_axis) as i32;
+            match cam_axis {
+                'x' | 'X' => aabb_wire(
+                    IVec3::new(a.x, a.y - r, a.z - r),
+                    IVec3::new(a.x, a.y + r, a.z + r),
+                ),
+                'y' | 'Y' => aabb_wire(
+                    IVec3::new(a.x - r, a.y, a.z - r),
+                    IVec3::new(a.x + r, a.y, a.z + r),
+                ),
+                _ => aabb_wire(
+                    IVec3::new(a.x - r, a.y - r, a.z),
+                    IVec3::new(a.x + r, a.y + r, a.z),
+                ),
+            }
+        }
+        DrawTool::Plane => {
+            let axis = flattest_axis(a, b);
+            let mut min = ivec_min(a, b);
+            let mut max = ivec_max(a, b);
+            match axis {
+                'x' => {
+                    min.x = a.x;
+                    max.x = a.x;
+                }
+                'y' => {
+                    min.y = a.y;
+                    max.y = a.y;
+                }
+                _ => {
+                    min.z = a.z;
+                    max.z = a.z;
+                }
+            }
+            aabb_wire(min, max)
+        }
+    }
+}
+
+fn shape_preview_status(tool: DrawTool, a: IVec3, b: IVec3, cam_axis: char) -> String {
+    match tool {
+        DrawTool::Voxel => String::new(),
+        DrawTool::Line => {
+            let n = (a.x - b.x).abs().max((a.y - b.y).abs()).max((a.z - b.z).abs()) + 1;
+            format!("line  {n} voxels  ·  click to commit")
+        }
+        DrawTool::Cube => {
+            let min = ivec_min(a, b);
+            let max = ivec_max(a, b);
+            format!(
+                "cube  {}×{}×{}  ·  click to commit",
+                max.x - min.x + 1,
+                max.y - min.y + 1,
+                max.z - min.z + 1
+            )
+        }
+        DrawTool::Sphere => {
+            format!(
+                "sphere  r={}  ·  click to commit",
+                euclidean_radius(a, b)
+            )
+        }
+        DrawTool::Circle => format!(
+            "circle  r={}  axis {cam_axis}  ·  click to commit",
+            in_plane_radius(a, b, cam_axis)
+        ),
+        DrawTool::Plane => {
+            let axis = flattest_axis(a, b);
+            let (w, h) = match axis {
+                'x' => ((a.y - b.y).abs() + 1, (a.z - b.z).abs() + 1),
+                'y' => ((a.x - b.x).abs() + 1, (a.z - b.z).abs() + 1),
+                _ => ((a.x - b.x).abs() + 1, (a.y - b.y).abs() + 1),
+            };
+            format!("plane  {w}×{h}  axis {axis}  ·  click to commit")
+        }
+    }
 }

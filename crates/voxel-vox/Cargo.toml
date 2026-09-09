@@ -3,7 +3,7 @@ name = "voxel_vox"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "MagicaVoxel .vox read/write (SIZE/XYZI/RGBA + extensions skipped safely)"
+description = "MagicaVoxel .vox read/write (SIZE/XYZI/RGBA, nTRN/nGRP/nSHP, MATL, LAYR)"
 
 [dependencies]
 thiserror.workspace = true

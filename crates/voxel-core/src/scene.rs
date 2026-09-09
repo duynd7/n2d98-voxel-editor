@@ -1,7 +1,7 @@
 //! MagicaVoxel-style scene graph (world editor).
 //! Nodes: Transform (nTRN) → Group (nGRP) | Shape (nSHP).
 
-use crate::{IVec3, Result, VoxelModel};
+use crate::{IVec3, LayerTable, MaterialTable, Result, VoxelModel};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -85,7 +85,7 @@ impl MvRotation {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransformNode {
     pub id: NodeId,
     pub name: String,
@@ -96,20 +96,20 @@ pub struct TransformNode {
     pub layer_id: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupNode {
     pub id: NodeId,
     pub name: String,
     pub children: Vec<NodeId>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShapeNode {
     pub id: NodeId,
     pub model_ids: Vec<ModelId>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SceneNode {
     Transform(TransformNode),
     Group(GroupNode),
@@ -143,14 +143,30 @@ pub struct WorldInstance {
     pub translation: IVec3,
     pub rotation: MvRotation,
     pub hidden: bool,
+    pub layer_id: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Object list entry for UI / MCP.
+#[derive(Debug, Clone)]
+pub struct ObjectRef {
+    pub id: NodeId,
+    pub name: String,
+    pub translation: IVec3,
+    pub hidden: bool,
+    pub model_id: ModelId,
+    pub layer_id: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scene {
     pub models: Vec<VoxelModel>,
     pub nodes: HashMap<NodeId, SceneNode>,
     pub root: NodeId,
     pub next_id: NodeId,
+    #[serde(default)]
+    pub layers: LayerTable,
+    #[serde(default)]
+    pub materials: MaterialTable,
 }
 
 impl Scene {
@@ -183,6 +199,8 @@ impl Scene {
             nodes,
             root: trn_id,
             next_id: 2,
+            layers: LayerTable::default(),
+            materials: MaterialTable::default(),
         }
     }
 
@@ -215,6 +233,7 @@ impl Scene {
             false,
             0,
             "",
+            -1,
             &mut out,
         );
         out
@@ -228,6 +247,7 @@ impl Scene {
         parent_hidden: bool,
         owner_trn: NodeId,
         owner_name: &str,
+        owner_layer: i32,
         out: &mut Vec<WorldInstance>,
     ) {
         let Some(node) = self.nodes.get(&node_id) else {
@@ -235,7 +255,8 @@ impl Scene {
         };
         match node {
             SceneNode::Transform(trn) => {
-                let hidden = parent_hidden || trn.hidden;
+                let hidden =
+                    parent_hidden || trn.hidden || self.layers.is_hidden(trn.layer_id);
                 let composed_t = {
                     let lt = parent_r.rotate_vec(trn.translation);
                     IVec3::new(parent_t.x + lt.x, parent_t.y + lt.y, parent_t.z + lt.z)
@@ -248,6 +269,7 @@ impl Scene {
                     hidden,
                     trn.id,
                     &trn.name,
+                    trn.layer_id,
                     out,
                 );
             }
@@ -260,6 +282,7 @@ impl Scene {
                         parent_hidden,
                         owner_trn,
                         owner_name,
+                        owner_layer,
                         out,
                     );
                 }
@@ -273,6 +296,7 @@ impl Scene {
                         translation: parent_t,
                         rotation: parent_r,
                         hidden: parent_hidden,
+                        layer_id: owner_layer,
                     });
                 }
             }
@@ -388,6 +412,22 @@ impl Scene {
         }
     }
 
+    pub fn set_object_layer(&mut self, trn_id: NodeId, layer_id: i32) -> bool {
+        if let Some(SceneNode::Transform(trn)) = self.nodes.get_mut(&trn_id) {
+            trn.layer_id = layer_id;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn object_layer(&self, trn_id: NodeId) -> Option<i32> {
+        match self.nodes.get(&trn_id) {
+            Some(SceneNode::Transform(trn)) => Some(trn.layer_id),
+            _ => None,
+        }
+    }
+
     /// Model id referenced by a transform (first shape model).
     pub fn model_id_for_transform(&self, trn_id: NodeId) -> Option<ModelId> {
         let SceneNode::Transform(trn) = self.nodes.get(&trn_id)? else {
@@ -404,24 +444,52 @@ impl Scene {
         }
     }
 
-    pub fn list_objects(&self) -> Vec<(NodeId, String, IVec3, bool, ModelId)> {
+    pub fn list_objects(&self) -> Vec<ObjectRef> {
         self.collect_instances()
             .into_iter()
-            .filter(|i| !i.hidden)
-            .map(|i| {
-                (
-                    i.transform_id,
-                    if i.name.is_empty() {
-                        format!("object_{}", i.transform_id)
-                    } else {
-                        i.name.clone()
-                    },
-                    i.translation,
-                    i.hidden,
-                    i.model_id,
-                )
+            .map(|i| ObjectRef {
+                id: i.transform_id,
+                name: if i.name.is_empty() {
+                    format!("object_{}", i.transform_id)
+                } else {
+                    i.name.clone()
+                },
+                translation: i.translation,
+                hidden: i.hidden,
+                model_id: i.model_id,
+                layer_id: i.layer_id,
             })
             .collect()
+    }
+
+    /// Detach a transform instance from its parent group and drop the node.
+    /// Does not delete `self.root`. Models are left in place (orphans are OK).
+    pub fn remove_object(&mut self, trn_id: NodeId) -> bool {
+        if trn_id == self.root {
+            return false;
+        }
+        let Some(SceneNode::Transform(trn)) = self.nodes.get(&trn_id).cloned() else {
+            return false;
+        };
+        let child_id = trn.child;
+        for node in self.nodes.values_mut() {
+            if let SceneNode::Group(grp) = node {
+                grp.children.retain(|&id| id != trn_id);
+            }
+        }
+        self.nodes.remove(&trn_id);
+
+        let shape_still_used = self.nodes.values().any(|n| match n {
+            SceneNode::Transform(t) => t.child == child_id,
+            SceneNode::Group(g) => g.children.contains(&child_id),
+            SceneNode::Shape(_) => false,
+        });
+        if !shape_still_used {
+            if matches!(self.nodes.get(&child_id), Some(SceneNode::Shape(_))) {
+                self.nodes.remove(&child_id);
+            }
+        }
+        true
     }
 }
 
@@ -458,4 +526,54 @@ pub fn world_to_local(world: IVec3, translation: IVec3, rotation: MvRotation) ->
         mt[1][0] * p.x + mt[1][1] * p.y + mt[1][2] * p.z,
         mt[2][0] * p.x + mt[2][1] * p.y + mt[2][2] * p.z,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Material, MaterialKind, VoxelModel};
+
+    #[test]
+    fn hidden_layer_hides_instances() {
+        let mut scene = Scene::from_single_model(VoxelModel::new(4, 4, 4).unwrap());
+        if let Some(SceneNode::Transform(t)) = scene.nodes.get_mut(&0) {
+            t.layer_id = 1;
+        }
+        assert!(!scene.collect_instances()[0].hidden);
+        scene.layers.set_hidden(1, true);
+        assert!(scene.collect_instances()[0].hidden);
+        assert_eq!(scene.collect_instances()[0].layer_id, 1);
+    }
+
+    #[test]
+    fn material_dict_roundtrip_metal() {
+        let mat = Material {
+            kind: MaterialKind::Glass,
+            weight: 0.4,
+            ior: 0.35,
+            att: 0.1,
+            ..Material::default()
+        };
+        let pairs = mat.to_dict();
+        let map: std::collections::HashMap<_, _> = pairs.into_iter().collect();
+        let back = Material::from_dict(&map);
+        assert_eq!(back.kind, MaterialKind::Glass);
+        assert!((back.weight - 0.4).abs() < 1e-5);
+        assert!((back.ior - 0.35).abs() < 1e-5);
+    }
+
+    #[test]
+    fn remove_object_drops_instance_from_list() {
+        let mut scene = Scene::from_single_model(VoxelModel::new(4, 4, 4).unwrap());
+        let extra = VoxelModel::new(4, 4, 4).unwrap();
+        let id = scene.add_object("extra", extra, IVec3::new(8, 0, 0));
+        let before: Vec<_> = scene.list_objects().into_iter().map(|o| o.id).collect();
+        assert!(before.contains(&id));
+        assert!(scene.remove_object(id));
+        let after: Vec<_> = scene.list_objects().into_iter().map(|o| o.id).collect();
+        assert!(!after.contains(&id));
+        assert_eq!(after.len(), before.len() - 1);
+        assert!(!scene.remove_object(scene.root));
+        assert_eq!(scene.list_objects().len(), after.len());
+    }
 }

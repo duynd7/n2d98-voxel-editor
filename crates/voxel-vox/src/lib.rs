@@ -1,4 +1,4 @@
-//! MagicaVoxel `.vox` reader/writer with scene graph (nTRN/nGRP/nSHP).
+//! MagicaVoxel `.vox` reader/writer with scene graph (nTRN/nGRP/nSHP), materials (MATL), and layers (LAYR).
 
 use std::fs::File;
 use std::io::Read;
@@ -133,5 +133,70 @@ mod tests {
         assert_eq!(s2.model(1).unwrap().get(1, 1, 1).unwrap(), 3);
         let objs = s2.list_objects();
         assert!(objs.len() >= 1);
+    }
+
+    #[test]
+    fn roundtrip_materials_and_layers() {
+        use voxel_core::{Material, MaterialKind};
+
+        let mut scene = Scene::from_single_model(VoxelModel::new(4, 4, 4).unwrap());
+        scene.models[0].set(1, 1, 1, 5).unwrap();
+        scene.materials.set(
+            5,
+            Material {
+                kind: MaterialKind::Metal,
+                weight: 0.7,
+                rough: 0.25,
+                spec: 0.8,
+                ..Material::default()
+            },
+        )
+        .unwrap();
+        scene.materials.set(
+            8,
+            Material {
+                kind: MaterialKind::Emit,
+                weight: 0.6,
+                flux: 2.0,
+                extra: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert("_glow".into(), "1".into());
+                    m
+                },
+                ..Material::default()
+            },
+        )
+        .unwrap();
+        scene.layers.layers[2].name = "props".into();
+        scene.layers.layers[2].hidden = true;
+        scene.layers.layers[2].color = [10, 20, 30];
+        if let Some(voxel_core::SceneNode::Transform(t)) = scene.nodes.get_mut(&0) {
+            t.layer_id = 2;
+        }
+
+        let palette = Palette::magicavoxel_default();
+        let bytes = write_vox_scene(&scene, &palette).unwrap();
+        let (s2, _) = read_vox_scene(&bytes).unwrap();
+
+        let metal = s2.materials.get(5);
+        assert_eq!(metal.kind, MaterialKind::Metal);
+        assert!((metal.weight - 0.7).abs() < 1e-4);
+        assert!((metal.rough - 0.25).abs() < 1e-4);
+        assert!((metal.spec - 0.8).abs() < 1e-4);
+
+        let emit = s2.materials.get(8);
+        assert_eq!(emit.kind, MaterialKind::Emit);
+        assert!((emit.flux - 2.0).abs() < 1e-4);
+        assert_eq!(emit.extra.get("_glow").map(String::as_str), Some("1"));
+
+        let layer = s2.layers.get(2).expect("layer 2");
+        assert_eq!(layer.name, "props");
+        assert!(layer.hidden);
+        assert_eq!(layer.color, [10, 20, 30]);
+        assert_eq!(s2.layers.layers.len(), 8);
+
+        let inst = s2.collect_instances();
+        assert!(inst.iter().all(|i| i.hidden), "hidden layer hides instances");
+        assert_eq!(inst[0].layer_id, 2);
     }
 }
